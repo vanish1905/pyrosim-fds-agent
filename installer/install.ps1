@@ -12,6 +12,10 @@ try {
             Remove-Item -LiteralPath $stalePath -Force
         }
     }
+    $legacyInternal = Join-Path $appDir '_internal'
+    if (Test-Path -LiteralPath $legacyInternal -PathType Container) {
+        Remove-Item -LiteralPath $legacyInternal -Recurse -Force
+    }
 
     $programs = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\PyroSim FDS Agent'
     New-Item -ItemType Directory -Path $programs -Force | Out-Null
