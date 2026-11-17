@@ -10,7 +10,9 @@ if getattr(sys, "frozen", False):
 else:
     APP_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = APP_ROOT / "config.json"
-if getattr(sys, "frozen", False):
+if os.environ.get("PYROSIM_AGENT_HOME"):
+    CONFIG_PATH = Path(os.environ["PYROSIM_AGENT_HOME"]) / "config.json"
+elif getattr(sys, "frozen", False):
     CONFIG_PATH = Path(os.environ.get("LOCALAPPDATA", str(APP_ROOT))) / "PyroSimFdsAgent" / "config.json"
 DEFAULT_CONFIG = {
     "pyrosim_root": "",
@@ -52,5 +54,8 @@ def mcp_server_command(app_root: Path = APP_ROOT) -> list[str]:
     """Return an MCP command that works from both source and frozen installs."""
     if getattr(sys, "frozen", False):
         return [str(Path(sys.executable).resolve()), "--mcp-server"]
-    return [sys.executable, "-m", "pyro_agent.mcp_server"]
+    executable = Path(sys.executable).resolve()
+    if executable.name.casefold() == "pythonw.exe":
+        executable = executable.with_name("python.exe")
+    return [str(executable), "-m", "pyro_agent.mcp_server"]
 

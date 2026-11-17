@@ -8,11 +8,11 @@ Install the desktop dependency once with `.venv\\Scripts\\python.exe -m pip inst
 
 ## Windows component installation
 
-For the downloadable Agent/FDS/model packages and first-run setup, see [docs/INSTALLATION.zh-CN.md](docs/INSTALLATION.zh-CN.md). The authenticated download and checksum-verifying PowerShell helper is `tools/install-components.ps1`; the repository is private, so GitHub CLI must be authenticated with read access first.
+For the downloadable Agent/FDS/model packages and first-run setup, see [docs/INSTALLATION.zh-CN.md](docs/INSTALLATION.zh-CN.md). The public-release download and checksum-verifying PowerShell helper is `tools/install-components.ps1`.
 
 ## Windows installer
 
-Run `powershell -ExecutionPolicy Bypass -File .\\build-windows.ps1` to build `dist\\PyroSim-FDS-Agent-Setup.exe`. The self-extracting Windows installer includes a multi-resolution flame/network icon, the Qt desktop, the stdio MCP server, Windows PyroSim UI Automation dependencies, `theng` results processing, and the bundled TEMPERATURE methane example when present. It installs per-user under `%LOCALAPPDATA%\\Programs`, creates Start Menu and Desktop shortcuts, and registers an uninstaller. PyroSim/FDS and OpenCode remain external prerequisites; configure their local executable paths in the workbench after installation. The installed app stores its preferences under `%LOCALAPPDATA%\\PyroSimFdsAgent`.
+Run `powershell -ExecutionPolicy Bypass -File .\\build-windows.ps1` to build the self-contained portable runtime and `dist\\PyroSim-FDS-Agent-Setup.exe`. The package includes its own Python runtime and dependencies, the Qt desktop, stdio MCP server, Windows PyroSim UI Automation dependencies, `theng` results processing, and TEMPERATURE example. The installer installs per-user under `%LOCALAPPDATA%\\Programs`, creates Start Menu and Desktop shortcuts, and registers an uninstaller. Launch diagnostics are written under `%LOCALAPPDATA%\\PyroSimFdsAgent\\logs`. PyroSim/FDS and OpenCode remain external prerequisites; configure their local executable paths in the workbench after installation. Preferences are stored under `%LOCALAPPDATA%\\PyroSimFdsAgent`.
 
 The configured case workspace is the only area the MCP server can read or write. Existing source cases are copied before edits. FDS runs are launched only after an explicit `approved: true` argument.
 

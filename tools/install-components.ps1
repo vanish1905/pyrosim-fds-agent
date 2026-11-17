@@ -1,6 +1,7 @@
 param(
     [switch]$InstallFds,
     [switch]$DownloadQwen,
+    [switch]$DownloadPortable,
     [switch]$DownloadOnly,
     [string]$DownloadDirectory = (Join-Path $env:USERPROFILE 'Downloads\PyroSim-FDS-Agent')
 )
@@ -8,11 +9,14 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = 'vanish1905/pyrosim-fds-agent'
 $release = 'installers-2026-11-17'
+$releaseBase = "https://github.com/$repo/releases/download/$release"
 $agentAsset = 'PyroSim-FDS-Agent-Setup.exe'
+$portableAsset = 'PyroSim-FDS-Agent-Portable.zip'
 $fdsAsset = 'FDS-6.11.1_SMV-6.11.2_win.exe'
 $qwenAsset = 'Qwen3-0.6B-Q8_0.gguf'
 $expectedHashes = @{
-    'PyroSim-FDS-Agent-Setup.exe' = 'E65D996775F7C8E71A5750645E40D651117DCD6985BA18884D7079AC5BCDCEB1'
+    'PyroSim-FDS-Agent-Setup.exe' = '6852AD7B68A86C53E7C3A3BA98C6FAA117BF986AA490128D58200DF84660D0CD'
+    'PyroSim-FDS-Agent-Portable.zip' = '8263120FFE4AF02F69C80AFDAFDBCF309A8511A74447C3F3CC29D5BFAD9851AC'
     'FDS-6.11.1_SMV-6.11.2_win.exe' = '302EC837CAAEA8CB990CECE085BEE2284A0338D64FAC0B77D46749A92AB12DFC'
     'Qwen3-0.6B-Q8_0.gguf' = '9465E63A22ADD5354D9BB4B99E90117043C7124007664907259BD16D043BB031'
 }
@@ -64,11 +68,14 @@ function Set-ReleaseProxy {
 }
 
 function Get-ReleaseAsset([string]$Name) {
-    Write-Host "Downloading $Name from private release $release ..."
-    & gh release download $release --repo $repo --pattern $Name --dir $DownloadDirectory --clobber
-    if ($LASTEXITCODE -ne 0) { throw "GitHub CLI could not download $Name. Check that gh is authenticated and has access to $repo." }
-
+    Write-Host "Downloading $Name from the public release ..."
     $path = Join-Path $DownloadDirectory $Name
+    $uri = "$releaseBase/$([Uri]::EscapeDataString($Name))"
+    try {
+        Invoke-WebRequest -Uri $uri -OutFile $path -UseBasicParsing
+    } catch {
+        throw "Could not download $Name from $uri. Check the network connection and try again. $($_.Exception.Message)"
+    }
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Downloaded asset is missing: $path" }
     $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToUpperInvariant()
     if ($actualHash -ne $expectedHashes[$Name]) { throw "SHA-256 verification failed for $Name. Expected $($expectedHashes[$Name]), got $actualHash." }
@@ -76,22 +83,16 @@ function Get-ReleaseAsset([string]$Name) {
     return $path
 }
 
-if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-    throw 'GitHub CLI (gh) is required. Install it from https://cli.github.com/ and authenticate with: gh auth login --hostname github.com --web --scopes repo'
-}
-
 Set-ReleaseProxy
-& gh auth status --hostname github.com *> $null
-if ($LASTEXITCODE -ne 0) {
-    throw 'GitHub CLI is not authenticated. Run: gh auth login --hostname github.com --web --scopes repo'
-}
 
 New-Item -ItemType Directory -Path $DownloadDirectory -Force | Out-Null
 $agentPath = Get-ReleaseAsset $agentAsset
+$portablePath = $null
 $fdsPath = $null
 $qwenPath = $null
 
 if ($InstallFds) { $fdsPath = Get-ReleaseAsset $fdsAsset }
+if ($DownloadPortable) { $portablePath = Get-ReleaseAsset $portableAsset }
 if ($DownloadQwen) {
     $modelDirectory = Join-Path $env:LOCALAPPDATA 'PyroSimFdsAgent\models'
     New-Item -ItemType Directory -Path $modelDirectory -Force | Out-Null
@@ -118,6 +119,7 @@ if (-not $DownloadOnly) {
 Write-Host ''
 Write-Host "Agent installer: $agentPath"
 if ($fdsPath) { Write-Host "FDS installer:   $fdsPath" }
+if ($portablePath) { Write-Host "Portable bundle: $portablePath" }
 if ($qwenPath) { Write-Host "Qwen model:      $qwenPath" }
 if ($DownloadOnly) { Write-Host 'Download-only mode: no installer was launched.' }
 Write-Host 'PyroSim and the local model runtime are separate prerequisites; see docs/INSTALLATION.zh-CN.md.'

@@ -4,7 +4,7 @@
 
 | 组件 | 获取方式 | 说明 |
 | --- | --- | --- |
-| PyroSim / FDS Agent | 本项目私有 GitHub Release | Qt 工作台、MCP 服务、TEMPERATURE 示例和桌面/开始菜单快捷方式。 |
+| PyroSim / FDS Agent | 本项目公开 GitHub Release | Qt 工作台、MCP 服务、TEMPERATURE 示例和桌面/开始菜单快捷方式。 |
 | FDS + Smokeview | 同一 Release | `FDS-6.11.1_SMV-6.11.2_win.exe`。此版本尚未完成项目适配器的版本验证，首次使用应先跑小算例。 |
 | Qwen3-0.6B Q8_0 | 同一 Release，可选 | GGUF 权重文件。它不是推理程序，需另装支持 GGUF 的本地推理运行时。 |
 | PyroSim | Thunderhead 官方渠道 | 商业软件，不包含在本仓库或 Release 中；使用者需自行取得安装包和授权。 |
@@ -12,11 +12,10 @@
 
 ## 方式一：使用安装脚本（推荐）
 
-脚本通过 GitHub CLI 下载私有 Release 附件，验证 SHA-256 后启动安装程序。先安装 [GitHub CLI](https://cli.github.com/)，并用有仓库读取权限的 GitHub 账号登录：
+脚本从公开 Release 下载附件并校验 SHA-256，不需要 GitHub CLI 或登录。先克隆公开仓库：
 
 ```powershell
-gh auth login --hostname github.com --web --scopes repo
-gh repo clone vanish1905/pyrosim-fds-agent
+git clone https://github.com/vanish1905/pyrosim-fds-agent.git
 cd pyrosim-fds-agent
 ```
 
@@ -42,7 +41,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\install-components.p
 
 ## 方式二：从 Release 手动安装
 
-打开[项目 Releases](https://github.com/vanish1905/pyrosim-fds-agent/releases)，下载 `PyroSim-FDS-Agent-Setup.exe` 后双击并确认安装。安装器会创建桌面和开始菜单快捷方式。FDS 安装包和 Qwen 模型按需下载。
+打开[项目 Releases](https://github.com/vanish1905/pyrosim-fds-agent/releases)，下载 `PyroSim-FDS-Agent-Setup.exe` 后双击并确认安装。安装器会创建桌面和开始菜单快捷方式。Agent 随包提供独立 Python 运行时，不要求目标电脑另装 Python；启动错误会记录到 `%LOCALAPPDATA%\PyroSimFdsAgent\logs\startup-error.log`。FDS 安装包和 Qwen 模型按需下载。
+
+也可以下载 `PyroSim-FDS-Agent-Portable.zip`，完整解压后运行 `launch-workbench.cmd`。新版不再用 VBScript 启动主程序；若仍有启动失败提示，请把 `%LOCALAPPDATA%\PyroSimFdsAgent\logs\startup-error.log` 发给维护者。若 Windows 安全提示拦截，请先核对 Release 中的 SHA-256，再按设备策略处理；此程序包没有 Authenticode 代码签名。
 
 ## 首次配置
 
