@@ -1,0 +1,23 @@
+{
+  "name": "pyrosim-fds-local",
+  "interface": {
+    "displayName": "PyroSim / FDS Plugins"
+  },
+  "plugins": [
+    {
+      "name": "pyrosim-fds-workflows",
+      "source": {
+        "source": "local",
+        "path": "./.agents/plugins/pyrosim-fds"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer tools",
+      "interface": {
+        "displayName": "PyroSim / FDS"
+      }
+    }
+  ]
+}

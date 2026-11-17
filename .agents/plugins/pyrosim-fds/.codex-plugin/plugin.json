@@ -1,0 +1,19 @@
+{
+  "name": "pyrosim-fds-workflows",
+  "version": "0.2.0",
+  "description": "PyroSim and FDS simulation workflow tools for Codex.",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "PyroSim / FDS",
+    "shortDescription": "Prepare, check, run, and monitor local FDS simulations.",
+    "longDescription": "Connects Codex to the local PyroSim/FDS MCP tools for safe case inspection, preflight, approval-gated simulation runs, status polling, and cancellation.",
+    "developerName": "Local",
+    "category": "Developer tools",
+    "capabilities": ["Read", "Write", "Execute"],
+    "defaultPrompt": [
+      "Inspect my FDS case and report any preflight issues.",
+      "Prepare a safe simulation workflow and explain what needs approval."
+    ]
+  }
+}

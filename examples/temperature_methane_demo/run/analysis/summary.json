@@ -1,0 +1,40 @@
+{
+  "workflow_id": "df7a0dc462db",
+  "case_id": "methane_flame_simple_2",
+  "model_name": "E:\\Codex\\pyro-fds-cases\\runs\\methane_flame_simple_2_20261113_224351_204589\\methane_flame_simple_2",
+  "fds_version": "FDS-6.9.1-0-g889da6a-release",
+  "title": "Verification of simple chemistry flame",
+  "simulation_end_time_s": 10.0,
+  "step_count": 1000,
+  "cpu_time_s": 11.297,
+  "hrr_peak": {
+    "value_kw": 130.08987,
+    "time_s": 0.64999998
+  },
+  "hrr_series_points": 1000,
+  "slice_count": 2,
+  "result_files": [
+    "fds.log",
+    "methane_flame_simple_2.fds",
+    "methane_flame_simple_2.out",
+    "methane_flame_simple_2.pickle",
+    "methane_flame_simple_2.smv",
+    "methane_flame_simple_2.smvv",
+    "methane_flame_simple_2_1_1.s3d",
+    "methane_flame_simple_2_1_1.s3d.sz",
+    "methane_flame_simple_2_1_1.sf",
+    "methane_flame_simple_2_1_1.sf.bnd",
+    "methane_flame_simple_2_1_2.s3d",
+    "methane_flame_simple_2_1_2.s3d.sz",
+    "methane_flame_simple_2_1_2.sf",
+    "methane_flame_simple_2_1_2.sf.bnd",
+    "methane_flame_simple_2_1_3.s3d",
+    "methane_flame_simple_2_1_3.s3d.sz",
+    "methane_flame_simple_2_cpu.csv",
+    "methane_flame_simple_2_devc.csv",
+    "methane_flame_simple_2_git.txt",
+    "methane_flame_simple_2_hrr.csv",
+    "methane_flame_simple_2_mass.csv",
+    "methane_flame_simple_2_steps.csv"
+  ]
+}

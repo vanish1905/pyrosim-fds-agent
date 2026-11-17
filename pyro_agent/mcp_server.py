@@ -1,0 +1,177 @@
+"""Minimal MCP stdio server using Python's standard library only."""
+from __future__ import annotations
+
+import json
+import sys
+import time
+import traceback
+import uuid
+
+from .config import load_config
+from . import fds_tools
+from . import pyrosim_tools
+from . import pyrosim_ui_bridge
+from . import workflows
+from . import results_tools
+from . import results_ui_bridge
+from . import presentation
+from .events import emit_event
+
+TOOLS = [
+    {"name": "inspect_installation", "description": "只读检测 PyroSim、FDS、Smokeview、Results 路径，并返回基于已记录成功工作流的版本/能力档案；可执行文件存在不等于版本兼容已验证。", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "inspect_adapter_capabilities", "description": "返回当前本机 PyroSim/FDS/theng 的适配器能力档案，区分 available、verified、experimental、unsupported 和需要版本检测的能力；不启动软件或执行仿真。", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "list_cases", "description": "列出配置的案例工作区根目录中的 .fds 算例。只读。", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "stage_official_methane_flame_demo", "description": "从 FDS 官方 GitHub 固定地址下载并校验 SHA-256 后，放入工作区的甲烷小火焰示例（100 kW、5 s 火源、10 s 总时长、2000 cells、温度和 HRRPUV 切片）。仅此固定样例，不接受任意 URL 或路径；不启动求解。", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "create_case", "description": "把工作区已有算例复制成新算例，不覆盖原文件，并尝试更新 CHID。", "inputSchema": {"type": "object", "properties": {"source_id": {"type": "string"}, "new_case_id": {"type": "string"}}, "required": ["source_id", "new_case_id"]}},
+    {"name": "create_case_with_updates", "description": "从现有算例创建新副本，只应用支持的 FDS 参数修改，并回读核验保存值；任何修改或核验失败都会删除本次新建的副本。自然语言应先映射为明确字段和值；当前只允许 TIME.T_END、TIME.DT、MESH.IJK。", "inputSchema": {"type": "object", "properties": {"source_id": {"type": "string"}, "new_case_id": {"type": "string"}, "updates": {"type": "object", "additionalProperties": {}}}, "required": ["source_id", "new_case_id", "updates"]}},
+    {"name": "inspect_case", "description": "解析并查看指定算例的 FDS namelist 字段、文件校验值。只读。", "inputSchema": {"type": "object", "properties": {"case_id": {"type": "string"}}, "required": ["case_id"]}},
+    {"name": "compare_case_inputs", "description": "只读比较两个工作区 FDS 文件的关键字段，可用于比较 PyroSim 手工导出后的算例与源算例。默认比较 TIME.T_END、TIME.DT、全部 MESH.IJK 和 MESH.XB；这不证明 PyroSim 几何或模型树完全等价。", "inputSchema": {"type": "object", "properties": {"case_a": {"type": "string"}, "case_b": {"type": "string"}, "fields": {"type": "array", "items": {"type": "string"}, "maxItems": 16}}, "required": ["case_a", "case_b"]}},
+    {"name": "preflight_case", "description": "求解前静态检查 FDS 输入：HEAD/TIME/MESH、网格尺寸、T_END 和本机 FDS。只读；返回错误、警告和是否可进入运行确认。", "inputSchema": {"type": "object", "properties": {"case_id": {"type": "string"}}, "required": ["case_id"]}},
+    {"name": "update_case_parameters", "description": "修改工作区内的算例副本。当前只允许 TIME.T_END、TIME.DT 和 MESH.IJK；禁止任意路径和任意 FDS 代码。", "inputSchema": {"type": "object", "properties": {"case_id": {"type": "string"}, "updates": {"type": "object", "additionalProperties": {}}}, "required": ["case_id", "updates"]}},
+    {"name": "run_fds", "description": "启动本机 FDS 计算。运行会占用本机资源，必须先向用户说明算例和 solver 并取得明确同意，再传 approved=true。输出在独立 runs 子目录，不覆盖源算例。", "inputSchema": {"type": "object", "properties": {"case_id": {"type": "string"}, "approved": {"type": "boolean"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400}}, "required": ["case_id", "approved"]}},
+    {"name": "prepare_simulation", "description": "创建可持久化的仿真工作流：执行静态预检查并冻结输入哈希快照。若检查通过则等待用户确认，不启动计算。", "inputSchema": {"type": "object", "properties": {"case_id": {"type": "string"}}, "required": ["case_id"]}},
+    {"name": "start_simulation", "description": "启动已准备的后台 FDS 工作流。必须先向用户说明算例、solver、快照哈希、预检查结果和计算开销并取得明确同意，再传 approved=true。返回 workflow_id；使用状态工具跟踪。", "inputSchema": {"type": "object", "properties": {"workflow_id": {"type": "string"}, "approved": {"type": "boolean"}, "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 86400}}, "required": ["workflow_id", "approved"]}},
+    {"name": "get_simulation_status", "description": "读取持久化 FDS 工作流状态、阶段、模拟时间、进度、日志摘要和结果文件。", "inputSchema": {"type": "object", "properties": {"workflow_id": {"type": "string"}}, "required": ["workflow_id"]}},
+    {"name": "analyze_simulation_results", "description": "对已完成的仿真工作流调用 theng 读取 .smv/HRR/steps/slice 结果，生成 JSON 摘要和可选 HRR HTML 图；结果只写入该工作流 runs 目录下的 analysis 子目录。", "inputSchema": {"type": "object", "properties": {"workflow_id": {"type": "string"}}, "required": ["workflow_id"]}},
+    {"name": "describe_result_presentation", "description": "只读生成已完成工作流的结果展示清单：列出 .smv、场变量、CSV、theng 摘要和 HRR 图，并分别报告原生 viewer、切片显示和时间控制状态；不打开 viewer，也不把文件存在误报为已渲染。", "inputSchema": {"type": "object", "properties": {"workflow_id": {"type": "string"}}, "required": ["workflow_id"]}},
+    {"name": "open_simulation_visualization", "description": "将已成功完成的工作流 .smv 传给 PyroSim Results，并立即返回 launch_requested；随后调用 results_ui_inspect 对目标窗口做有时限的只读回读。不调用全桌面 UIA 枚举，不修改模型，也不运行 FDS。", "inputSchema": {"type": "object", "properties": {"workflow_id": {"type": "string"}}, "required": ["workflow_id"]}},
+    {"name": "results_ui_inspect", "description": "只读检查 PyroSim Results 可见窗口、活动窗口、目标工作流 .smv 标题匹配情况和 UI Automation 控件树；通过指定 HWND 检查并将 UIA 工作放进 20 秒 watchdog，超时会终止隔离检查进程并返回错误。不点击、不播放、不改变结果显示。树项 selected 只表示导航树选择状态，不等于已确认该结果正在渲染。", "inputSchema": {"type": "object", "properties": {"workflow_id": {"type": "string"}}}},
+    {"name": "results_ui_set_display", "description": "对成功工作流的 PyroSim Results 执行幂等 show/hide：按完整 Navigation View 树路径唯一定位目标项，读取其上下文菜单中的 Show/Hide 命令来判定当前状态，只执行请求命令，再次读取菜单核验状态翻转。只影响 Results 可视化，不修改 FDS/PSM 模型或结果数据。", "inputSchema": {"type": "object", "properties": {"workflow_id": {"type": "string"}, "item_path": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 12}, "action": {"type": "string", "enum": ["show", "hide"]}}, "required": ["workflow_id", "item_path", "action"]}},
+    {"name": "results_ui_set_time", "description": "在与成功工作流 .smv 标题匹配的 PyroSim Results 中设置时间滑块位置，并从状态栏回读当前时间核验。", "inputSchema": {"type": "object", "properties": {"workflow_id": {"type": "string"}, "time_seconds": {"type": "number", "minimum": 0}}, "required": ["workflow_id", "time_seconds"]}},
+    {"name": "results_ui_set_playback", "description": "在与成功工作流 .smv 标题匹配的 PyroSim Results 中播放或暂停，并通过状态栏回读确认状态转换。", "inputSchema": {"type": "object", "properties": {"workflow_id": {"type": "string"}, "action": {"type": "string", "enum": ["play", "pause"]}}, "required": ["workflow_id", "action"]}},
+    {"name": "results_ui_adjust_speed", "description": "在 PyroSim Results 中按一个二倍档位调快或调慢动画，并回读状态栏速度。", "inputSchema": {"type": "object", "properties": {"workflow_id": {"type": "string"}, "direction": {"type": "string", "enum": ["slower", "faster"]}}, "required": ["workflow_id", "direction"]}},
+    {"name": "cancel_simulation", "description": "请求停止指定运行中或待确认的仿真工作流；不会删除输入快照或已生成结果。", "inputSchema": {"type": "object", "properties": {"workflow_id": {"type": "string"}}, "required": ["workflow_id"]}},
+    {"name": "list_simulation_workflows", "description": "列出最近的仿真工作流及其阶段、状态和实时进度。只读。", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100}}}},
+    {"name": "pyrosim_ui_inspect", "description": "按配置启动 PyroSim（若尚未运行），然后只读检查窗口、版本和 UI Automation 暴露的控件名称；不会打开、修改或保存模型。当前只启用 PyroSim 2024.2 档案。", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "pyrosim_ui_snapshot", "description": "读取当前运行中的 PyroSim 窗口及可见对话框的 UI Automation 快照，包括控件名称、可用状态和可读文本；不启动应用、不点击、不输入、不保存。用于每次受支持 UI 操作前后实时观察状态。当前只启用 2024.2。", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "pyrosim_dismiss_update_dialog", "description": "仅关闭 PyroSim 的精确 ‘Check for Updates’ 提示中的唯一 Close/关闭按钮，然后回读提示已消失且主窗口已启用；不会检查、下载或安装更新。其他窗口状态下一律停止。", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "pyrosim_cancel_file_dialog", "description": "只取消当前 PyroSim 标准打开/保存文件框；如果没有明确的取消按钮则停止。不会选择文件、保存、导入或导出。", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "pyrosim_confirm_fds6_dialog", "description": "仅在 PyroSim 的精确 FDS Version Selection Dialog 中读取选项、选择并回读 FDS6，然后确认导入格式；不会求解。没有唯一 FDS6 选项或确认按钮时停止。", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "pyrosim_dismiss_missing_import_error", "description": "仅当给定 model_id 的隔离 FDS 和 PSM 文件都已不存在、PyroSim 主窗因模态框禁用且唯一标题为 PyroSim 的对话框存在时，按 Enter 关闭此前的文件缺失提示。不会确认运行/保存或修改模型。", "inputSchema": {"type": "object", "properties": {"model_id": {"type": "string"}}, "required": ["model_id"]}},
+    {"name": "pyrosim_import_fds", "description": "把案例工作区中的 FDS 案例复制到 pyrosim_agent_gui/working，再通过 PyroSim 2024.2 UI 导入并另存为隔离的 PSM 副本。不会修改/覆盖源 FDS，也不会运行求解。标题和文件校验不能证明完整模型树等价；需安装 requirements-ui.txt。", "inputSchema": {"type": "object", "properties": {"case_id": {"type": "string"}, "new_model_id": {"type": "string", "description": "全新的隔离模型 ID，不能复用已有 ID"}}, "required": ["case_id", "new_model_id"]}},
+    {"name": "pyrosim_save_imported_copy", "description": "只恢复一个已开始的隔离 FDS 导入：要求当前 PyroSim 标题指向对应 staging FDS、另存为对话框唯一存在且目标 PSM 不存在；然后保存为新的 PSM 并登记哈希。拒绝覆盖，不运行求解。", "inputSchema": {"type": "object", "properties": {"case_id": {"type": "string"}, "model_id": {"type": "string"}}, "required": ["case_id", "model_id"]}},
+    {"name": "pyrosim_export_fds", "description": "仅打开由 pyrosim_import_fds 建立并登记的 PSM 副本，通过 PyroSim 2024.2 UI 导出到案例工作区一个全新 case ID；拒绝覆盖已有 FDS 文件，并与导入来源比对关键字段。不会运行求解。参数比对不能证明完整几何/模型树等价；需安装 requirements-ui.txt。", "inputSchema": {"type": "object", "properties": {"model_id": {"type": "string"}, "new_case_id": {"type": "string", "description": "全新的输出算例 ID，不能覆盖已有文件"}}, "required": ["model_id", "new_case_id"]}},
+    {"name": "pyrosim_open_model_copy", "description": "把配置案例工作区内的 .psm 模型复制到 pyrosim_agent_prototype/working，校验 SHA-256 后通过 Windows 文件关联请求 PyroSim 打开副本，并等待可见窗口标题确认副本路径。源文件不修改；标题确认不代表已读取或修改模型内容。", "inputSchema": {"type": "object", "properties": {"model_path": {"type": "string", "description": "相对于案例工作区的 .psm 路径，或工作区内的绝对路径"}}, "required": ["model_path"]}},
+]
+
+
+def call_tool(name: str, args: dict) -> dict:
+    config = load_config()
+    funcs = {
+        "inspect_installation": lambda: fds_tools.inspect_installation(config),
+        "inspect_adapter_capabilities": lambda: fds_tools.inspect_installation(config)["adapter_profiles"],
+        "list_cases": lambda: fds_tools.list_cases(config),
+        "stage_official_methane_flame_demo": lambda: fds_tools.stage_official_methane_flame_demo(config),
+        "create_case": lambda: fds_tools.create_case(config, args.get("source_id"), args.get("new_case_id")),
+        "create_case_with_updates": lambda: fds_tools.create_case_with_updates(
+            config, args.get("source_id"), args.get("new_case_id"), args.get("updates")),
+        "inspect_case": lambda: fds_tools.inspect_case(config, args.get("case_id")),
+        "compare_case_inputs": lambda: fds_tools.compare_case_inputs(
+            config, args.get("case_a"), args.get("case_b"), args.get("fields")),
+        "preflight_case": lambda: fds_tools.preflight_case(config, args.get("case_id")),
+        "update_case_parameters": lambda: fds_tools.update_parameters(config, args.get("case_id"), args.get("updates")),
+        "run_fds": lambda: fds_tools.run_case(config, args.get("case_id"), args.get("approved", False), args.get("timeout_seconds", 3600)),
+        "prepare_simulation": lambda: workflows.prepare_simulation(config, args.get("case_id")),
+        "start_simulation": lambda: workflows.start_simulation(config, args.get("workflow_id"), args.get("approved", False), args.get("timeout_seconds", 3600)),
+        "get_simulation_status": lambda: workflows.get_simulation_status(config, args.get("workflow_id")),
+        "analyze_simulation_results": lambda: results_tools.analyze_simulation_results(config, args.get("workflow_id")),
+        "describe_result_presentation": lambda: presentation.describe_result_presentation(config, args.get("workflow_id")),
+        "open_simulation_visualization": lambda: results_tools.open_simulation_visualization(config, args.get("workflow_id")),
+        "results_ui_inspect": lambda: results_ui_bridge.inspect_results_ui(config, args.get("workflow_id")),
+        "results_ui_set_display": lambda: results_ui_bridge.set_results_display(
+            config, args.get("workflow_id"), args.get("item_path"), args.get("action")),
+        "results_ui_set_time": lambda: results_ui_bridge.set_results_time(config, args.get("workflow_id"), args.get("time_seconds")),
+        "results_ui_set_playback": lambda: results_ui_bridge.set_results_playback(config, args.get("workflow_id"), args.get("action")),
+        "results_ui_adjust_speed": lambda: results_ui_bridge.adjust_results_speed(config, args.get("workflow_id"), args.get("direction")),
+        "cancel_simulation": lambda: workflows.cancel_simulation(config, args.get("workflow_id")),
+        "list_simulation_workflows": lambda: workflows.list_simulation_workflows(config, args.get("limit", 20)),
+        "pyrosim_ui_inspect": lambda: pyrosim_ui_bridge.inspect_ui(config),
+        "pyrosim_ui_snapshot": lambda: pyrosim_ui_bridge.snapshot_ui(config),
+        "pyrosim_dismiss_update_dialog": lambda: pyrosim_ui_bridge.dismiss_update_dialog(config),
+        "pyrosim_cancel_file_dialog": lambda: pyrosim_ui_bridge.cancel_file_dialog(config),
+        "pyrosim_confirm_fds6_dialog": lambda: pyrosim_ui_bridge.resolve_fds6_dialog(config),
+        "pyrosim_dismiss_missing_import_error": lambda: pyrosim_ui_bridge.dismiss_missing_import_file_error(config, args.get("model_id")),
+        "pyrosim_import_fds": lambda: pyrosim_ui_bridge.import_fds(config, args.get("case_id"), args.get("new_model_id")),
+        "pyrosim_save_imported_copy": lambda: pyrosim_ui_bridge.save_imported_copy(config, args.get("case_id"), args.get("model_id")),
+        "pyrosim_export_fds": lambda: pyrosim_ui_bridge.export_fds(config, args.get("model_id"), args.get("new_case_id")),
+        "pyrosim_open_model_copy": lambda: pyrosim_tools.open_model_copy(config, args.get("model_path")),
+    }
+    if name not in funcs:
+        raise fds_tools.ToolError(f"Unknown tool: {name}")
+    case_id = args.get("case_id") or args.get("new_case_id") or args.get("case_a")
+    invocation_id = uuid.uuid4().hex[:12]
+    started = time.monotonic()
+    emit_event(config, "tool_started", f"Agent 调用本地工具：{name}", tool=name,
+               invocation_id=invocation_id, arguments=args, case_id=case_id)
+    try:
+        result = funcs[name]()
+        fds_tools.write_audit(config, name, result)
+        if name == "pyrosim_open_model_copy":
+            message = ("PyroSim 窗口已显示隔离副本路径" if result.get("gui_open_verified")
+                       else "已请求 PyroSim 打开隔离副本，尚未确认窗口标题")
+            emit_event(config, "pyrosim_open_requested", message,
+                       model_path=result.get("working_copy"), source_model=result.get("source_model"),
+                       source_unchanged=result.get("source_unchanged"),
+                       verified=result.get("gui_open_verified"), window_title=result.get("window_title"))
+        emit_event(config, "tool_finished", f"本地工具完成：{name}", tool=name,
+                   invocation_id=invocation_id, case_id=case_id,
+                   duration_seconds=round(time.monotonic() - started, 3), result=result)
+        return result
+    except Exception as exc:
+        emit_event(config, "tool_failed", f"本地工具失败：{name} · {exc}", tool=name,
+                   invocation_id=invocation_id,
+                   case_id=case_id, duration_seconds=round(time.monotonic() - started, 3))
+        raise
+
+
+def respond(message: dict) -> dict | None:
+    method = message.get("method")
+    request_id = message.get("id")
+    params = message.get("params") or {}
+    if method == "notifications/initialized" or method == "notifications/cancelled":
+        return None
+    if method == "initialize":
+        return {"jsonrpc": "2.0", "id": request_id, "result": {
+            "protocolVersion": params.get("protocolVersion", "2024-11-05"),
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "pyrosim-fds-agent", "version": "0.1.0"},
+        }}
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": request_id, "result": {}}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}}
+    if method == "tools/call":
+        try:
+            result = call_tool(params.get("name", ""), params.get("arguments") or {})
+            return {"jsonrpc": "2.0", "id": request_id, "result": {
+                "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
+                "structuredContent": result,
+                "isError": False,
+            }}
+        except Exception as exc:
+            return {"jsonrpc": "2.0", "id": request_id, "result": {
+                "content": [{"type": "text", "text": str(exc) or f"{type(exc).__name__}: {exc!r}"}], "isError": True,
+            }}
+    if request_id is None:
+        return None
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Method not found: {method}"}}
+
+
+def main() -> None:
+    sys.stdin.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8")
+    for line in sys.stdin:
+        try:
+            message = json.loads(line)
+            response = respond(message)
+            if response is not None:
+                sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+                sys.stdout.flush()
+        except Exception as exc:
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}}) + "\n")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
+

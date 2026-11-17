@@ -1,0 +1,33 @@
+# User-specific configuration and generated OpenCode runtime files
+/config.json
+/.runtime/
+
+# Python environments and caches
+/.venv/
+**/__pycache__/
+*.py[cod]
+
+# Build output and packaged installer payloads
+/build/
+/dist/
+/installer/payload/
+/installer/app-payload.zip
+*.spec
+
+# Logs and local workflow state
+*_script_logging.txt
+*.log
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+
+# Generated solver cache/log artifacts in the bundled example
+/examples/temperature_methane_demo/run/*.pickle
+/examples/temperature_methane_demo/run/*.out
+/examples/temperature_methane_demo/run/*_git.txt
+/examples/temperature_methane_demo/run/*.sf*
+/examples/temperature_methane_demo/run/*.s3d*
+/examples/temperature_methane_demo/run/*.smv
+/examples/temperature_methane_demo/run/*.smvv
+/examples/temperature_methane_demo/run/*.csv
+/examples/temperature_methane_demo/run/analysis/hrr.html
