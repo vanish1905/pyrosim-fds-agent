@@ -9,11 +9,12 @@ import subprocess
 import time
 import threading
 import queue
+import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-from .config import case_root, runtime_paths
+from .config import APP_ROOT, case_root, runtime_paths
 from .events import emit_event
 from .adapter_profiles import build_adapter_profile_report
 
@@ -126,29 +127,44 @@ def list_cases(config: dict) -> dict:
 
 
 def stage_official_methane_flame_demo(config: dict) -> dict:
-    """Stage one pinned, small FDS verification example from the official FDS repository."""
+    """Stage the pinned FDS verification example from the bundled official copy.
+
+    The official input is shipped with the workbench, so a destination machine
+    does not need GitHub access or an outbound proxy to start the example.
+    A fixed official URL remains as a fallback for source checkouts missing the
+    bundled example; either path must match the same SHA-256 and content checks.
+    """
     case_id = "methane_flame_simple_2"
     source_url = "https://raw.githubusercontent.com/firemodels/fds/master/Verification/Species/methane_flame_simple_2.fds"
     expected_sha256 = "e92e89d650b37d9d9f87af4ddba33a5795c6a7fdf0448a7f8a2865f83cccfbc6"
+    bundled_source = APP_ROOT / "examples" / "temperature_methane_demo" / "run" / f"{case_id}.fds"
     destination = case_root(config) / f"{case_id}.fds"
     if destination.exists():
         current_hash = hashlib.sha256(destination.read_bytes()).hexdigest()
         if current_hash != expected_sha256:
             raise ToolError(f"目标算例已存在且不是此官方版本：{case_id}")
         return {"case_id": case_id, "file": str(destination), "sha256": current_hash,
-                "source_url": source_url, "already_staged": True}
-    request = urllib.request.Request(source_url, headers={"User-Agent": "pyrosim-fds-agent/0.1"})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        content = response.read(20_001)
+                "source_url": source_url, "source_kind": "verified_workspace_copy", "already_staged": True}
+    if bundled_source.is_file():
+        content = bundled_source.read_bytes()
+        source_kind = "bundled_official_copy"
+    else:
+        request = urllib.request.Request(source_url, headers={"User-Agent": "pyrosim-fds-agent/0.1"})
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                content = response.read(20_001)
+        except (OSError, urllib.error.URLError) as exc:
+            raise ToolError(f"未找到随包官方算例，且无法从固定官方地址下载：{exc}") from exc
+        source_kind = "downloaded_official_copy"
     if len(content) > 20_000 or hashlib.sha256(content).hexdigest() != expected_sha256:
-        raise ToolError("下载内容大小或 SHA-256 与固定官方样例不符；未写入算例目录。")
+        raise ToolError("算例大小或 SHA-256 与固定官方样例不符；未写入算例目录。")
     text = content.decode("utf-8-sig")
     if not all(token in text for token in ("&HEAD CHID='methane_flame_simple_2'", "HRRPUA = 625.",
                                              "T_END=10.0", "QUANTITY = 'TEMPERATURE'", "QUANTITY = 'HRRPUV'")):
         raise ToolError("官方样例内容未通过结构核验；未写入算例目录。")
     destination.write_bytes(content)
     return {"case_id": case_id, "file": str(destination), "sha256": expected_sha256,
-            "source_url": source_url, "already_staged": False,
+            "source_url": source_url, "source_kind": source_kind, "already_staged": False,
             "demo": {"burner_hrrpua_kw_m2": 625, "burner_area_m2": 0.16,
                      "nominal_peak_hrr_kw": 100, "fire_duration_s": 5,
                      "t_end_s": 10, "mesh_cells": 2000,
