@@ -38,6 +38,7 @@ from . import fds_tools
 from . import path_discovery
 from .config import APP_ROOT, load_config, save_config, mcp_server_command
 from . import model_support
+from . import local_model_runtime
 from .opencode_environment import configure_opencode_environment
 
 
@@ -330,6 +331,30 @@ class LocalTemperatureWorkflowWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class LocalQwenWorker(QThread):
+    state = Signal(str)
+    ready = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, runtime):
+        super().__init__()
+        self.runtime = runtime
+        self.cancel_event = __import__("threading").Event()
+
+    def run(self):
+        try:
+            started = self.runtime.start(cancel=self.cancel_event, progress=self.state.emit)
+            self.state.emit("本地 Qwen 已启动，正在核验模型服务和工具调用…")
+            probe = model_support.check_local_model(started["endpoint"], started["model"], timeout=30)
+            self.ready.emit({**started, "probe": probe})
+        except Exception as exc:
+            self.runtime.stop()
+            self.failed.emit(str(exc))
+
+    def cancel(self):
+        self.cancel_event.set()
+
+
 class Workbench(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -349,6 +374,14 @@ class Workbench(QMainWindow):
         self.local_temperature_pending_id = ""
         self.local_temperature_case_id = ""
         self.local_temperature_worker = None
+        self.local_qwen_worker = None
+        self.local_qwen_endpoint = ""
+        self._close_after_local_qwen_worker = False
+        self.local_qwen = local_model_runtime.LocalQwenRuntime(
+            APP_ROOT,
+            model_root=local_model_runtime.resolve_model_root(APP_ROOT),
+            log_root=Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "PyroSimFdsAgent" / "logs",
+        )
         self.companion_hwnd = None
         self.companion_placement = None
         self.companion_saved_min_size = None
@@ -1381,6 +1414,22 @@ class Workbench(QMainWindow):
         box.addWidget(QLabel("本地模型服务（可选，OpenAI 兼容 API）"))
         box.addWidget(self.local_endpoint_edit)
         box.addWidget(self.local_model_edit)
+        qwen_row = QHBoxLayout()
+        self.local_qwen_button = QPushButton("启动内置 Qwen3-0.6B")
+        self.local_qwen_button.setObjectName("primary")
+        self.local_qwen_button.clicked.connect(self.start_local_qwen)
+        self.local_qwen_stop_button = QPushButton("停止")
+        self.local_qwen_stop_button.clicked.connect(self.stop_local_qwen)
+        qwen_row.addWidget(self.local_qwen_button)
+        qwen_row.addWidget(self.local_qwen_stop_button)
+        get_qwen = QPushButton("获取模型安装包")
+        get_qwen.clicked.connect(self.open_local_model_release)
+        qwen_row.addWidget(get_qwen)
+        box.addLayout(qwen_row)
+        self.local_qwen_status = QLabel(self._local_qwen_initial_status())
+        self.local_qwen_status.setObjectName("muted")
+        self.local_qwen_status.setWordWrap(True)
+        box.addWidget(self.local_qwen_status)
         local_row = QHBoxLayout()
         check_local = QPushButton("检查连接与工具调用")
         check_local.clicked.connect(self.check_local_model)
@@ -1414,6 +1463,82 @@ class Workbench(QMainWindow):
         box.addWidget(tip)
         box.addStretch(1)
         return card
+
+    def _local_qwen_initial_status(self) -> str:
+        if self.local_qwen.installed():
+            return f"内置 Qwen 已安装 · {self.local_qwen.model_path}"
+        return "内置 Qwen 模型包尚未安装；可下载独立安装包后离线启动。"
+
+    def open_local_model_release(self):
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl("https://github.com/vanish1905/pyrosim-fds-agent/releases/latest"))
+
+    def start_local_qwen(self):
+        if self.local_qwen_worker and self.local_qwen_worker.isRunning():
+            return
+        if not self.local_qwen.installed():
+            self.local_qwen_status.setText("未找到本地模型包。请点击“获取模型安装包”，安装后再启动。")
+            QMessageBox.information(
+                self, "未安装本地模型",
+                "请先安装 Release 中的 PyroSim-FDS-Agent-LocalModel-Setup.exe，\n"
+                "然后重新启动工作台。模型和推理服务均在本机运行。",
+            )
+            return
+        self.local_qwen_button.setEnabled(False)
+        self.local_qwen_status.setText("正在启动内置 Qwen…")
+        self.local_qwen_worker = LocalQwenWorker(self.local_qwen)
+        self.local_qwen_worker.state.connect(self.local_qwen_status.setText)
+        self.local_qwen_worker.ready.connect(self._local_qwen_ready)
+        self.local_qwen_worker.failed.connect(self._local_qwen_failed)
+        self.local_qwen_worker.finished.connect(lambda: self.local_qwen_button.setEnabled(True))
+        self.local_qwen_worker.start()
+
+    def _local_qwen_ready(self, result: dict):
+        self.local_qwen_endpoint = result["endpoint"]
+        self.local_endpoint_edit.setText(result["endpoint"])
+        self.local_model_edit.setText(result["model"])
+        probe = result["probe"]
+        self.config_data["local_model_tools_verified"] = bool(probe.get("tool_call_supported"))
+        self.save_model_configuration()
+        route = "Vulkan GPU" if result.get("backend") == "vulkan" else "CPU"
+        fallback = result.get("fallback_reason")
+        detail = probe.get("tool_call_detail", "")
+        self.local_qwen_status.setText(
+            f"内置 Qwen 已就绪 · {route} · {result['endpoint']} · "
+            f"{'工具调用已验证' if probe.get('tool_call_supported') else '工具调用未验证'}"
+            + (f"\nGPU 回退原因：{fallback}" if fallback else "")
+            + (f"\n{detail}" if detail else "")
+        )
+
+    def _local_qwen_failed(self, message: str):
+        self.local_qwen_status.setText(f"内置 Qwen 启动或核验失败：{message}")
+        QMessageBox.warning(self, "本地模型未就绪", message)
+
+    def stop_local_qwen(self):
+        endpoint = self.local_endpoint_edit.text().strip()
+        self.local_qwen.stop()
+        if self.local_qwen_endpoint and endpoint == self.local_qwen_endpoint:
+            self.local_endpoint_edit.clear()
+            self.local_model_edit.clear()
+            self.config_data["local_model_endpoint"] = ""
+            self.config_data["local_model_name"] = ""
+            self.config_data["local_model_tools_verified"] = False
+            save_config(self.config_data)
+        self.local_qwen_endpoint = ""
+        self.local_qwen_status.setText("内置 Qwen 已停止。")
+
+    def closeEvent(self, event):
+        if self.local_qwen_worker and self.local_qwen_worker.isRunning():
+            if not self._close_after_local_qwen_worker:
+                self._close_after_local_qwen_worker = True
+                self.local_qwen_worker.cancel()
+                self.local_qwen.stop()
+                self.local_qwen_worker.finished.connect(self.close)
+            event.ignore()
+            return
+        self.stop_local_qwen()
+        super().closeEvent(event)
 
     def _field(self, parent, label, edit, browse):
         parent.addWidget(QLabel(label))

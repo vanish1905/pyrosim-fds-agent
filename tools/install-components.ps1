@@ -2,6 +2,7 @@ param(
     [switch]$InstallFds,
     [switch]$DownloadQwen,
     [switch]$DownloadPortable,
+    [switch]$InstallLocalModel,
     [switch]$DownloadOnly,
     [string]$DownloadDirectory = (Join-Path $env:USERPROFILE 'Downloads\PyroSim-FDS-Agent')
 )
@@ -14,11 +15,13 @@ $agentAsset = 'PyroSim-FDS-Agent-Setup.exe'
 $portableAsset = 'PyroSim-FDS-Agent-Portable.zip'
 $fdsAsset = 'FDS-6.11.1_SMV-6.11.2_win.exe'
 $qwenAsset = 'Qwen3-0.6B-Q8_0.gguf'
+$localModelAsset = 'PyroSim-FDS-Agent-LocalModel-Setup.exe'
 $expectedHashes = @{
-    'PyroSim-FDS-Agent-Setup.exe' = 'A80D7C3DEABC472D879455A60771E8C3C1F5638D912EDFB777F6F328B79DC50A'
-    'PyroSim-FDS-Agent-Portable.zip' = '8263120FFE4AF02F69C80AFDAFDBCF309A8511A74447C3F3CC29D5BFAD9851AC'
+    'PyroSim-FDS-Agent-Setup.exe' = '6001555E58FD503CE9F58CA84C63FB63713179E5CD2903F821AB73BE76E4997B'
+    'PyroSim-FDS-Agent-Portable.zip' = 'E065F211BDE89B6F190F263A76EE75A3AB3A5D7702C44F29B6857A0F7D4B40D9'
     'FDS-6.11.1_SMV-6.11.2_win.exe' = '302EC837CAAEA8CB990CECE085BEE2284A0338D64FAC0B77D46749A92AB12DFC'
     'Qwen3-0.6B-Q8_0.gguf' = '9465E63A22ADD5354D9BB4B99E90117043C7124007664907259BD16D043BB031'
+    'PyroSim-FDS-Agent-LocalModel-Setup.exe' = '655F4A6F8CA2C8AEEB98A690CC7D7A9C0E154992EC7E5A731C8FA5A4B8D64BC7'
 }
 
 function Set-ReleaseProxy {
@@ -90,6 +93,7 @@ $agentPath = Get-ReleaseAsset $agentAsset
 $portablePath = $null
 $fdsPath = $null
 $qwenPath = $null
+$localModelPath = $null
 
 if ($InstallFds) { $fdsPath = Get-ReleaseAsset $fdsAsset }
 if ($DownloadPortable) { $portablePath = Get-ReleaseAsset $portableAsset }
@@ -103,6 +107,7 @@ if ($DownloadQwen) {
         $qwenPath = $modelDestination
     }
 }
+if ($InstallLocalModel) { $localModelPath = Get-ReleaseAsset $localModelAsset }
 
 if (-not $DownloadOnly) {
     Write-Host 'Launching the per-user Agent installer. Follow its confirmation prompt.'
@@ -114,6 +119,12 @@ if (-not $DownloadOnly) {
         $process = Start-Process -FilePath $fdsPath -Wait -PassThru
         if ($process.ExitCode -ne 0) { throw "FDS installer exited with code $($process.ExitCode)." }
     }
+
+    if ($InstallLocalModel) {
+        Write-Host 'Launching the offline Qwen/llama.cpp model installer. Complete its confirmation prompt.'
+        $process = Start-Process -FilePath $localModelPath -Wait -PassThru
+        if ($process.ExitCode -ne 0) { throw "Local model installer exited with code $($process.ExitCode)." }
+    }
 }
 
 Write-Host ''
@@ -121,5 +132,6 @@ Write-Host "Agent installer: $agentPath"
 if ($fdsPath) { Write-Host "FDS installer:   $fdsPath" }
 if ($portablePath) { Write-Host "Portable bundle: $portablePath" }
 if ($qwenPath) { Write-Host "Qwen model:      $qwenPath" }
+if ($localModelPath) { Write-Host "Local model:     $localModelPath" }
 if ($DownloadOnly) { Write-Host 'Download-only mode: no installer was launched.' }
-Write-Host 'PyroSim and the local model runtime are separate prerequisites; see docs/INSTALLATION.zh-CN.md.'
+Write-Host 'PyroSim is a separate prerequisite; see docs/INSTALLATION.zh-CN.md.'

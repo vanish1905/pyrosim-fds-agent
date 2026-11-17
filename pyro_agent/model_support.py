@@ -71,6 +71,12 @@ def model_ref(model_name: str) -> str:
     return f"pyro-local/{key}"
 
 
+def _open_loopback(request: urllib.request.Request, timeout: float):
+    """Connect to local model APIs without sending loopback traffic through a proxy."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(request, timeout=timeout)
+
+
 def list_opencode_models(executable: str, app_root: Path, endpoint: str = "",
                          model_name: str = "", tools_verified: bool = False) -> list[str]:
     config = write_runtime_config(app_root, endpoint, model_name, tools_verified)
@@ -107,7 +113,7 @@ def check_local_model(endpoint: str, model_name: str, timeout: float = 15) -> di
     url = base if base.endswith("/v1") else base + "/v1"
     request = urllib.request.Request(url + "/models", headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _open_loopback(request, timeout) as response:
             inventory = json.loads(response.read().decode("utf-8"))
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"无法连接模型服务 {url}/models：{exc}") from exc
@@ -130,7 +136,7 @@ def check_local_model(endpoint: str, model_name: str, timeout: float = 15) -> di
     tool_supported = False
     tool_detail = "模型未返回 tool_calls。"
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _open_loopback(request, timeout) as response:
             completion = json.loads(response.read().decode("utf-8"))
         choices = completion.get("choices", [])
         if choices:
@@ -200,7 +206,7 @@ def local_workflow_decision(endpoint: str, model_name: str, phase: str, observat
     request = urllib.request.Request(url + "/chat/completions", data=json.dumps(payload).encode("utf-8"),
                                      headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _open_loopback(request, timeout) as response:
             completion = json.loads(response.read().decode("utf-8"))
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"本地模型阶段判断失败：{exc}") from exc

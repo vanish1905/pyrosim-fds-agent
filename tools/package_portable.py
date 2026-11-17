@@ -104,7 +104,7 @@ def build_payload(output: Path) -> None:
         raise RuntimeError(f"Bundled runtime check failed:\n{check.stdout}\n{check.stderr}")
 
     manifest = {
-        "version": "1.0.1",
+        "version": "1.0.2",
         "platform": "Windows-x64",
         "python": platform.python_version(),
         "created_utc": datetime.now(timezone.utc).isoformat(),
