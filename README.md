@@ -6,6 +6,10 @@ Local Windows MVP: a small desktop configuration console plus a stdio MCP server
 
 Install the desktop dependency once with `.venv\\Scripts\\python.exe -m pip install -r requirements.txt`, then run `start-workbench.cmd`. Set the PyroSim folder and a case workspace in Settings, then click **Save and inspect**. The MCP server is configured in the included `opencode.json`; copy that config into a project that OpenCode opens, or use `OpenCode > Install project config` from the console.
 
+## Windows component installation
+
+For the downloadable Agent/FDS/model packages and first-run setup, see [docs/INSTALLATION.zh-CN.md](docs/INSTALLATION.zh-CN.md). The authenticated download and checksum-verifying PowerShell helper is `tools/install-components.ps1`; the repository is private, so GitHub CLI must be authenticated with read access first.
+
 ## Windows installer
 
 Run `powershell -ExecutionPolicy Bypass -File .\\build-windows.ps1` to build `dist\\PyroSim-FDS-Agent-Setup.exe`. The self-extracting Windows installer includes a multi-resolution flame/network icon, the Qt desktop, the stdio MCP server, Windows PyroSim UI Automation dependencies, `theng` results processing, and the bundled TEMPERATURE methane example when present. It installs per-user under `%LOCALAPPDATA%\\Programs`, creates Start Menu and Desktop shortcuts, and registers an uninstaller. PyroSim/FDS and OpenCode remain external prerequisites; configure their local executable paths in the workbench after installation. The installed app stores its preferences under `%LOCALAPPDATA%\\PyroSimFdsAgent`.
