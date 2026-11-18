@@ -152,6 +152,35 @@ def check_local_model(endpoint: str, model_name: str, timeout: float = 15) -> di
             "model_found": matched, "tool_call_supported": tool_supported, "tool_call_detail": tool_detail}
 
 
+def local_model_chat(endpoint: str, model_name: str, messages: list[dict], timeout: float = 120) -> str:
+    """Send ordinary chat directly to a loopback model API, without tools/MCP."""
+    base = endpoint.strip().rstrip("/")
+    name = model_name.strip()
+    if not base or not name:
+        raise ValueError("请先启动内置模型，或填写本地服务地址和模型名称。")
+    parsed = urllib.parse.urlparse(base)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("本地模型对话仅允许连接 localhost / 127.0.0.1 服务。")
+    url = base if base.endswith("/v1") else base + "/v1"
+    payload = {"model": name, "messages": messages, "temperature": 0.3, "max_tokens": 1024}
+    request = urllib.request.Request(
+        url + "/chat/completions", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with _open_loopback(request, timeout) as response:
+            completion = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"本地模型对话请求失败：{exc}") from exc
+    try:
+        content = completion["choices"][0]["message"].get("content", "")
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("本地模型没有返回有效的聊天回复。") from exc
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("本地模型返回了空回复。")
+    return content.strip()
+
+
 def local_workflow_decision(endpoint: str, model_name: str, phase: str, observation: dict,
                             timeout: float = 45) -> dict:
     """Ask a local model for one constrained continue/stop decision.

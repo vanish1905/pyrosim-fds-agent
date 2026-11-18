@@ -357,6 +357,23 @@ class LocalQwenWorker(QThread):
         self.cancel_event.set()
 
 
+class LocalChatWorker(QThread):
+    answer = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, endpoint: str, model_name: str, messages: list[dict]):
+        super().__init__()
+        self.endpoint = endpoint
+        self.model_name = model_name
+        self.messages = messages
+
+    def run(self):
+        try:
+            self.answer.emit(model_support.local_model_chat(self.endpoint, self.model_name, self.messages))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class Workbench(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -376,12 +393,16 @@ class Workbench(QMainWindow):
             self.theme = "dark"
         self.session_id = ""
         self.worker = None
+        self.local_chat_worker = None
+        self.local_chat_history = []
+        self.local_chat_pending_user = ""
         self.local_temperature_pending_id = ""
         self.local_temperature_case_id = ""
         self.local_temperature_worker = None
         self.local_qwen_worker = None
         self.local_qwen_endpoint = ""
         self._close_after_local_qwen_worker = False
+        self._close_after_local_chat_worker = False
         self.local_qwen = local_model_runtime.LocalQwenRuntime(
             APP_ROOT,
             model_root=local_model_runtime.resolve_model_root(APP_ROOT),
@@ -577,6 +598,9 @@ class Workbench(QMainWindow):
         if self.agent_mode != "local":
             self._append_chat("提示", "请先在执行方式中选择“本地模型”。")
             return
+        if self.local_chat_worker and self.local_chat_worker.isRunning():
+            self.chat_state.setText("本地模型正在回复；请等待普通聊天完成后再启动工作流。")
+            return
         if self.local_temperature_worker and self.local_temperature_worker.isRunning():
             return
         endpoint = self.local_endpoint_edit.text().strip()
@@ -738,19 +762,20 @@ class Workbench(QMainWindow):
     def _update_agent_mode_ui(self):
         if not hasattr(self, "send_button") or not hasattr(self, "local_temperature_button"):
             return
-        busy = bool(self.worker and self.worker.isRunning())
+        busy = bool((self.worker and self.worker.isRunning())
+                    or (self.local_chat_worker and self.local_chat_worker.isRunning()))
         local_busy = bool(self.local_temperature_worker and self.local_temperature_worker.isRunning())
         for button in self.agent_mode_buttons.values():
             button.setEnabled(not (busy or local_busy))
         is_opencode = self.agent_mode == "opencode"
         is_local = self.agent_mode == "local"
-        self.send_button.setEnabled(is_opencode and not busy)
-        self.prompt.setEnabled(is_opencode and not busy)
+        self.send_button.setEnabled((is_opencode or is_local) and not busy and not local_busy)
+        self.prompt.setEnabled((is_opencode or is_local) and not busy and not local_busy)
         self.temperature_example_button.setEnabled(is_opencode and not busy)
-        self.local_temperature_button.setEnabled(is_local and not local_busy)
+        self.local_temperature_button.setEnabled(is_local and not local_busy and not busy)
         self.chat_hint.setText({
             "opencode": "OpenCode 模式：消息只交给 OpenCode，使用所选 OpenCode 模型和 MCP。要用 Qwen，请切换到“本地模型”。",
-            "local": "本地模型模式：不启动 OpenCode、不走其 MCP 路由。当前仅支持受约束的 TEMPERATURE 工作流，点击上方按钮开始。",
+            "local": "本地模型模式：普通聊天直接发送到本机模型 API，不经过 OpenCode/MCP；TEMPERATURE 工作流由上方按钮单独启动。",
             "codex": "Codex 插件模式：请在 Codex 对话中使用 PyroSim / FDS 插件。此模式下 Qt 不会把消息转发给 OpenCode 或本地模型。",
         }[self.agent_mode])
         self.chat_state.setText({
@@ -781,15 +806,62 @@ class Workbench(QMainWindow):
         self.chat.append(self._chat_html(role, message))
 
     def new_chat(self):
-        if self.worker and self.worker.isRunning():
+        if ((self.worker and self.worker.isRunning())
+                or (self.local_chat_worker and self.local_chat_worker.isRunning())):
             return
         self.session_id = ""
+        self.local_chat_history.clear()
         self.chat.clear()
         self._update_agent_mode_ui()
 
+    def _send_local_message(self):
+        message = self.prompt.toPlainText().strip()
+        if not message or (self.local_chat_worker and self.local_chat_worker.isRunning()):
+            return
+        if self.local_temperature_worker and self.local_temperature_worker.isRunning():
+            self.chat_state.setText("本地 TEMPERATURE 工作流正在执行；请等待当前阶段结束。")
+            return
+        endpoint = self.local_endpoint_edit.text().strip()
+        model_name = self.local_model_edit.text().strip()
+        if not endpoint or not model_name:
+            QMessageBox.information(self, "本地模型未配置", "请先启动内置 Qwen，或填写本地模型服务地址和模型名称。")
+            return
+        self._save()
+        self.prompt.clear()
+        self.local_chat_pending_user = message
+        self._append_chat("你", message)
+        messages = [{"role": "system", "content": (
+            "你是 PyroSim/FDS Agent 的本地聊天助手。当前是普通聊天直连模式，不能调用工具、MCP、OpenCode、"
+            "Codex 插件或操作软件。不要声称已经检查、修改或运行了任何算例。需要实际软件操作时，"
+            "说明用户可使用上方 TEMPERATURE 工作流，或切换到 OpenCode/Codex 执行方式。"
+        )}, *self.local_chat_history[-12:], {"role": "user", "content": message}]
+        self.send_button.setEnabled(False)
+        self.prompt.setEnabled(False)
+        self.chat_state.setText(f"本地模型正在回复 · {model_name}")
+        self.local_chat_worker = LocalChatWorker(endpoint, model_name, messages)
+        self.local_chat_worker.answer.connect(self._local_chat_answer)
+        self.local_chat_worker.failed.connect(self._local_chat_failed)
+        self.local_chat_worker.finished.connect(self._update_agent_mode_ui)
+        self.local_chat_worker.start()
+
+    def _local_chat_answer(self, answer: str):
+        self.local_chat_history.extend([
+            {"role": "user", "content": self.local_chat_pending_user},
+            {"role": "assistant", "content": answer},
+        ])
+        self._append_chat("Agent · 本地模型", answer)
+        self.chat_state.setText("本地模型对话完成 · 未调用 OpenCode 或 MCP")
+
+    def _local_chat_failed(self, message: str):
+        self._append_chat("本地模型错误", message)
+        self.chat_state.setText("本地模型对话失败 · 检查服务是否已启动")
+
     def send_message(self):
-        if self.agent_mode != "opencode":
-            self._append_chat("提示", "当前执行方式不是 OpenCode；消息未转发。请切换到 OpenCode 后再发送。")
+        if self.agent_mode == "codex":
+            self._append_chat("提示", "当前执行方式是 Codex 插件；消息未转发。请在 Codex 对话中使用插件。")
+            return
+        if self.agent_mode == "local":
+            self._send_local_message()
             return
         message = self.prompt.toPlainText().strip()
         if not message or (self.worker and self.worker.isRunning()):
@@ -1592,6 +1664,12 @@ class Workbench(QMainWindow):
         self.local_qwen_status.setText("内置 Qwen 已停止。")
 
     def closeEvent(self, event):
+        if self.local_chat_worker and self.local_chat_worker.isRunning():
+            if not self._close_after_local_chat_worker:
+                self._close_after_local_chat_worker = True
+                self.local_chat_worker.finished.connect(self.close)
+            event.ignore()
+            return
         if self.local_qwen_worker and self.local_qwen_worker.isRunning():
             if not self._close_after_local_qwen_worker:
                 self._close_after_local_qwen_worker = True
