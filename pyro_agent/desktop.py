@@ -16,6 +16,7 @@ from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QFont, QFontDatabase, QIcon, QTextOption
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QProgressBar,
     QScrollArea,
     QSizePolicy,
@@ -365,6 +367,9 @@ class Workbench(QMainWindow):
         self.resize(1260, 900)
         self.setMinimumSize(1000, 720)
         self.config_data = load_config()
+        self.agent_mode = self.config_data.get("agent_mode", "opencode")
+        if self.agent_mode not in {"opencode", "local", "codex"}:
+            self.agent_mode = "opencode"
         self._compact_style_active = False
         self.theme = self.config_data.get("theme", "dark")
         if self.theme not in {"dark", "light"}:
@@ -569,6 +574,9 @@ class Workbench(QMainWindow):
         self.chat_state.setText("已载入 TEMPERATURE 全流程示例 · 发送后由 Agent 执行")
 
     def _run_local_temperature_workflow(self):
+        if self.agent_mode != "local":
+            self._append_chat("提示", "请先在执行方式中选择“本地模型”。")
+            return
         if self.local_temperature_worker and self.local_temperature_worker.isRunning():
             return
         endpoint = self.local_endpoint_edit.text().strip()
@@ -605,7 +613,7 @@ class Workbench(QMainWindow):
         self.local_temperature_worker.prepared.connect(self._on_local_temperature_prepared)
         self.local_temperature_worker.answer.connect(self._on_local_temperature_answer)
         self.local_temperature_worker.failed.connect(self._on_local_temperature_failed)
-        self.local_temperature_worker.finished.connect(lambda: self.local_temperature_button.setEnabled(True))
+        self.local_temperature_worker.finished.connect(self._update_agent_mode_ui)
         self.local_temperature_worker.start()
 
     def _on_local_temperature_state(self, state: str):
@@ -665,6 +673,21 @@ class Workbench(QMainWindow):
         activity_title = QLabel("实时操作 · PyroSim 伴随 / FDS 求解 / Agent 工具")
         activity_title.setObjectName("muted")
         box.addWidget(activity_title)
+        mode_row = QHBoxLayout()
+        mode_label = QLabel("执行方式")
+        mode_label.setObjectName("section")
+        mode_row.addWidget(mode_label)
+        self.agent_mode_group = QButtonGroup(self)
+        self.agent_mode_buttons = {}
+        for key, label in (("opencode", "OpenCode"), ("local", "本地模型"), ("codex", "Codex 插件")):
+            button = QRadioButton(label)
+            button.setChecked(self.agent_mode == key)
+            self.agent_mode_group.addButton(button)
+            self.agent_mode_buttons[key] = button
+            button.toggled.connect(lambda checked, mode=key: checked and self.set_agent_mode(mode))
+            mode_row.addWidget(button)
+        mode_row.addStretch(1)
+        box.addLayout(mode_row)
         example_row = QHBoxLayout()
         self.temperature_example_button = QPushButton("载入 TEMPERATURE 全流程示例")
         self.temperature_example_button.setToolTip(
@@ -700,8 +723,41 @@ class Workbench(QMainWindow):
         hint.setWordWrap(True)
         self.chat_hint = hint
         box.addWidget(hint)
+        self._update_agent_mode_ui()
         self.prompt.installEventFilter(self)
         return card
+
+    def set_agent_mode(self, mode: str):
+        if mode not in {"opencode", "local", "codex"}:
+            return
+        self.agent_mode = mode
+        self.config_data["agent_mode"] = mode
+        save_config(self.config_data)
+        self._update_agent_mode_ui()
+
+    def _update_agent_mode_ui(self):
+        if not hasattr(self, "send_button") or not hasattr(self, "local_temperature_button"):
+            return
+        busy = bool(self.worker and self.worker.isRunning())
+        local_busy = bool(self.local_temperature_worker and self.local_temperature_worker.isRunning())
+        for button in self.agent_mode_buttons.values():
+            button.setEnabled(not (busy or local_busy))
+        is_opencode = self.agent_mode == "opencode"
+        is_local = self.agent_mode == "local"
+        self.send_button.setEnabled(is_opencode and not busy)
+        self.prompt.setEnabled(is_opencode and not busy)
+        self.temperature_example_button.setEnabled(is_opencode and not busy)
+        self.local_temperature_button.setEnabled(is_local and not local_busy)
+        self.chat_hint.setText({
+            "opencode": "OpenCode 模式：消息只交给 OpenCode，使用所选 OpenCode 模型和 MCP。要用 Qwen，请切换到“本地模型”。",
+            "local": "本地模型模式：不启动 OpenCode、不走其 MCP 路由。当前仅支持受约束的 TEMPERATURE 工作流，点击上方按钮开始。",
+            "codex": "Codex 插件模式：请在 Codex 对话中使用 PyroSim / FDS 插件。此模式下 Qt 不会把消息转发给 OpenCode 或本地模型。",
+        }[self.agent_mode])
+        self.chat_state.setText({
+            "opencode": "当前模式 · OpenCode / MCP",
+            "local": "当前模式 · 本地模型固定工作流",
+            "codex": "当前模式 · Codex 插件（在 Codex 对话中操作）",
+        }[self.agent_mode])
 
     def eventFilter(self, watched, event):
         from PySide6.QtCore import QEvent
@@ -729,9 +785,12 @@ class Workbench(QMainWindow):
             return
         self.session_id = ""
         self.chat.clear()
-        self.chat_state.setText("新对话 · OpenCode MCP")
+        self._update_agent_mode_ui()
 
     def send_message(self):
+        if self.agent_mode != "opencode":
+            self._append_chat("提示", "当前执行方式不是 OpenCode；消息未转发。请切换到 OpenCode 后再发送。")
+            return
         message = self.prompt.toPlainText().strip()
         if not message or (self.worker and self.worker.isRunning()):
             return
@@ -779,6 +838,10 @@ class Workbench(QMainWindow):
         self.send_button.setEnabled(False)
         self.chat_state.setText("正在连接 OpenCode…")
         selected_model = self.model_combo.currentText().strip()
+        if selected_model.startswith("pyro-local/"):
+            self.send_button.setEnabled(True)
+            QMessageBox.warning(self, "模型模式不匹配", "当前选择的是本地模型。请切换到“本地模型”执行方式，或在 OpenCode 模型列表中选择 OpenCode 模型。")
+            return
         runtime_config = model_support.write_runtime_config(
             APP_ROOT, self.local_endpoint_edit.text(), self.local_model_edit.text(),
             bool(self.config_data.get("local_model_tools_verified", False)),
@@ -789,7 +852,7 @@ class Workbench(QMainWindow):
         self.worker.state.connect(self._on_opencode_state)
         self.worker.failed.connect(self._chat_failed)
         self.worker.finished_session.connect(self._set_session)
-        self.worker.finished.connect(lambda: self.send_button.setEnabled(True))
+        self.worker.finished.connect(self._update_agent_mode_ui)
         self.worker.start()
 
     def _set_session(self, session_id: str):
@@ -1594,11 +1657,14 @@ class Workbench(QMainWindow):
                 self.config_data.get("local_model_name", ""),
                 bool(self.config_data.get("local_model_tools_verified", False)),
             )
+            models = [model for model in models if not model.startswith("pyro-local/")]
             selected = self.config_data.get("opencode_model", "")
             self.model_combo.clear()
             self.model_combo.addItems(models)
-            if selected:
+            if selected in models:
                 self.model_combo.setCurrentText(selected)
+            elif models:
+                self.model_combo.setCurrentIndex(0)
             self.model_status.setText(f"已读取 {len(models)} 个 OpenCode 模型；当前对话使用所选项。")
         except Exception as exc:
             self.model_status.setText("模型列表刷新失败；仍可手动输入 provider/model。")
@@ -1659,6 +1725,7 @@ class Workbench(QMainWindow):
             "local_model_endpoint": self.local_endpoint_edit.text().strip(),
             "local_model_name": self.local_model_edit.text().strip(),
             "cc_switch_exe": self.cc_switch_edit.text().strip(),
+            "agent_mode": self.agent_mode,
             "theme": self.theme,
         })
         save_config(self.config_data)

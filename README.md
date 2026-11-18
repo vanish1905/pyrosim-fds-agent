@@ -20,6 +20,8 @@ The configured case workspace is the only area the MCP server can read or write.
 
 The Settings panel's **Auto-detect invalid paths** action checks the saved values, `PYROSIM_ROOT` / `PYRO_FDS_CASE_ROOT`, OpenCode on `PATH`, Windows PyroSim registration, and standard install folders. It fills only invalid or empty fields and shows the source of each candidate; it does not crawl drives or save settings automatically. A valid configured folder remains authoritative, including when there are other installs. The OpenCode MCP config is generated from the active checkout at startup and passed as inline config content, so a copied `opencode.json` with an old E: checkout cannot override the active D: MCP path. This path binding is separate from discovery of the installed PyroSim and case workspace.
 
+The Agent chat has an explicit, persisted execution-mode selector. OpenCode mode sends messages only to the OpenCode process and excludes the local-model provider from the OpenCode model picker. Local-model mode disables chat forwarding and exposes only the fixed TEMPERATURE workflow. Codex-plugin mode disables Qt message sending and directs work to the Codex host's plugin. Switching modes cannot re-route the current Qt message to a different host.
+
 OpenCode subprocesses inherit existing `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` settings. If those proxy variables are absent, the companion reads the current user's static Windows Internet proxy setting and passes it only to the spawned OpenCode process, with loopback MCP addresses excluded. It does not change machine/user proxy settings or copy proxy credentials. PAC-only settings are not interpreted; configure proxy environment variables in that case.
 
 ## Current scope
