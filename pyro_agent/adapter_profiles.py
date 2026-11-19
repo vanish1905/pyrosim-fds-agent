@@ -131,6 +131,7 @@ def build_adapter_profile_report(installation: dict[str, Any],
         "capabilities": {
             "inspect_fds_input": "available",
             "add_burner_obstruction_copy": "available",
+            "edit_obstruction_geometry_copy": "available",
             "edit_allowlisted_surface_parameters_copy": "available",
             "edit_arbitrary_geometry": "unsupported",
             "edit_arbitrary_surface_parameters": "unsupported",

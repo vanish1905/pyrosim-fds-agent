@@ -879,6 +879,202 @@ def add_obstruction_to_case(config: dict, source_id: str, new_case_id: str, xb: 
         raise
 
 
+def create_case_with_obstruction_updates(config: dict, source_id: str, new_case_id: str,
+                                         obstruction_id: str, xb: list[float]) -> dict:
+    """Clone a case and replace only XB on one existing &OBST matched by ID.
+
+    The edit surface is intentionally narrow: one existing OBST is selected by
+    its parsed ID, only a simple existing XB value is replaced in place, and no
+    other text or field is touched. Any failure removes only the copy made by
+    this call.
+    """
+    import math
+
+    invalid_xb = "xb 必须是 6 个有限数值：[xmin,xmax,ymin,ymax,zmin,zmax]。"
+    if not isinstance(obstruction_id, str) or not obstruction_id or len(obstruction_id) > 128:
+        raise ToolError("obstruction_id 必须是非空字符串，用于精确匹配已有 &OBST.ID。")
+    if not isinstance(xb, list) or len(xb) != 6:
+        raise ToolError(invalid_xb)
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in xb):
+        raise ToolError(invalid_xb)
+    try:
+        coords = [float(value) for value in xb]
+    except (OverflowError, ValueError):
+        raise ToolError(invalid_xb) from None
+    if not all(math.isfinite(value) for value in coords):
+        raise ToolError(invalid_xb)
+    if any(coords[i] >= coords[i + 1] for i in (0, 2, 4)):
+        raise ToolError("xb 每个轴的最小值都必须小于最大值。")
+    new_case_id = _case_id(new_case_id)
+
+    source_path = _case_file(config, source_id)
+    source_text = source_path.read_text(encoding="utf-8-sig")
+    source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    source_match_objects = list(RECORD_RE.finditer(source_text))
+    source_records = [{"record": match.group(1).upper(),
+                       "fields": _parse_namelist_fields(match.group(2))}
+                      for match in source_match_objects]
+
+    source_meshes = [record["fields"] for record in source_records if record["record"] == "MESH"]
+    if not source_meshes:
+        raise ToolError("源算例没有 &MESH 记录，无法验证障碍物是否位于计算域内。")
+    mesh_domains = []
+    for index, fields in enumerate(source_meshes, 1):
+        mesh_xb = fields.get("XB")
+        valid = (isinstance(mesh_xb, list) and len(mesh_xb) == 6
+                 and all(not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v)
+                         for v in mesh_xb)
+                 and all(float(mesh_xb[i]) < float(mesh_xb[i + 1]) for i in (0, 2, 4)))
+        if not valid:
+            raise ToolError(f"源算例第 {index} 个 &MESH 的 XB 缺失或无效，无法安全验证障碍物范围。")
+        mesh_domains.append([float(v) for v in mesh_xb])
+    containing_meshes = [index for index, domain in enumerate(mesh_domains, 1)
+                         if all(domain[i] <= coords[i] and coords[i + 1] <= domain[i + 1] for i in (0, 2, 4))]
+    if not containing_meshes:
+        raise ToolError("障碍物必须完整位于至少一个源 &MESH.XB 范围内（边界可重合）。")
+
+    replacement = ",".join(repr(value) for value in coords)
+
+    def locate_xb(body: str) -> tuple[int, int]:
+        tokens = _namelist_field_tokens(body)
+        indexes = [index for index, token in enumerate(tokens) if token["key"] == "XB"]
+        if not indexes:
+            raise ToolError("目标 &OBST 没有 XB 字段；本工具只替换已有 XB，不追加字段。")
+        if len(indexes) > 1:
+            raise ToolError("目标 &OBST 的 XB 字段出现多次，无法确定要替换哪一个。")
+        index = indexes[0]
+        span = tokens[index]["value_span"]
+        if span is None:
+            raise ToolError("目标 &OBST 的 XB 没有可替换的值。")
+        start = span[0]
+        end = tokens[index + 1]["field_start"] if index + 1 < len(tokens) else _namelist_content_end(body)
+        raw = body[start:end]
+        comment = raw.find("!")
+        if comment >= 0:
+            raw = raw[:comment]
+        value_text = raw.strip()
+        if value_text.endswith(","):
+            value_text = value_text[:-1].rstrip()
+        if not value_text:
+            raise ToolError("目标 &OBST 的 XB 没有可替换的值。")
+        inner = value_text[1:-1].strip() if value_text.startswith("(") and value_text.endswith(")") else value_text
+        parts = [part.strip() for part in inner.split(",")]
+        if len(parts) != 6:
+            raise ToolError("目标 &OBST 的现有 XB 不是 6 个简单数值，无法安全替换。")
+        for part in parts:
+            try:
+                float(part)
+            except ValueError:
+                raise ToolError("目标 &OBST 的现有 XB 不是 6 个简单数值，无法安全替换。") from None
+        return start, start + len(value_text)
+
+    created = create_case(config, source_id, new_case_id)
+    destination = Path(created["file"])
+    try:
+        text = destination.read_text(encoding="utf-8-sig")
+        matches = list(RECORD_RE.finditer(text))
+        records = [{"record": match.group(1).upper(),
+                    "fields": _parse_namelist_fields(match.group(2))}
+                   for match in matches]
+        target_indexes = [index for index, record in enumerate(records)
+                          if record["record"] == "OBST" and record["fields"].get("ID") == obstruction_id]
+        if not target_indexes:
+            raise ToolError(f"复制后的算例中找不到 ID 为 {obstruction_id!r} 的 &OBST 记录。")
+        if len(target_indexes) > 1:
+            raise ToolError(f"复制后的算例中存在 {len(target_indexes)} 条 ID 为 {obstruction_id!r} 的 &OBST 记录，"
+                            "无法确定唯一目标。")
+        target_index = target_indexes[0]
+        if (target_index >= len(source_records)
+                or source_records[target_index]["record"] != "OBST"
+                or source_records[target_index]["fields"].get("ID") != obstruction_id):
+            raise ToolError("源算例与复制算例的 &OBST 记录位置不一致；已回滚新副本。")
+
+        target_match = matches[target_index]
+        body = target_match.group(2)
+        source_body = source_match_objects[target_index].group(2)
+        if body != source_body:
+            raise ToolError("复制后的目标 &OBST 文本与源算例不一致；已回滚新副本。")
+        id_tokens = [token for token in _namelist_field_tokens(body) if token["key"] == "ID"]
+        if len(id_tokens) != 1:
+            raise ToolError("目标 &OBST 的 ID 字段缺失或重复，无法确定唯一目标；已回滚新副本。")
+        start, end = locate_xb(body)
+        text = text[:target_match.start(2)] + body[:start] + replacement + body[end:] + text[target_match.end(2):]
+        destination.write_text(text, encoding="utf-8")
+
+        readback = inspect_case(config, new_case_id)
+        readback_targets = [record for record in readback["records"]
+                            if record["record"] == "OBST" and record["fields"].get("ID") == obstruction_id]
+        if len(readback_targets) != 1:
+            raise ToolError(f"回读得到 {len(readback_targets)} 条 ID 为 {obstruction_id!r} 的 &OBST 记录，"
+                            "无法确认唯一目标；已回滚新副本。")
+        target_fields = readback_targets[0]["fields"]
+        if target_fields.get("XB") != coords:
+            raise ToolError(f"保存后 &OBST.XB 回读不一致：{target_fields.get('XB')}，应为 {coords}；已回滚新副本。")
+
+        source_obst_count = sum(1 for record in source_records if record["record"] == "OBST")
+        readback_obst_count = sum(1 for record in readback["records"] if record["record"] == "OBST")
+        if readback_obst_count != source_obst_count:
+            raise ToolError("回读发现 &OBST 记录数量发生变化；已回滚新副本。")
+        if len(readback["records"]) != len(source_records):
+            raise ToolError("回读发现 FDS 记录数量发生变化；已回滚新副本。")
+
+        new_matches = list(RECORD_RE.finditer(text))
+        if len(new_matches) != len(source_match_objects):
+            raise ToolError("回读发现 FDS 记录边界发生变化；已回滚新副本。")
+        new_body = new_matches[target_index].group(2)
+        if new_body != source_body[:start] + replacement + source_body[end:]:
+            raise ToolError("目标 &OBST 的 XB 以外文本被意外改变；已回滚新副本。")
+        for index, (before, after) in enumerate(zip(source_records, readback["records"])):
+            if index == target_index:
+                if set(after["fields"]) != set(before["fields"]):
+                    raise ToolError("目标 &OBST 的字段集合被意外改变；已回滚新副本。")
+                for key, value in before["fields"].items():
+                    if key == "XB":
+                        continue
+                    if after["fields"].get(key) != value:
+                        raise ToolError(f"目标 &OBST 的非 XB 字段 {key} 被意外改变；已回滚新副本。")
+                continue
+            if before["record"] == "HEAD":
+                before_fields = dict(before["fields"])
+                after_fields = dict(after["fields"])
+                before_fields.pop("CHID", None)
+                after_fields.pop("CHID", None)
+                if before_fields != after_fields:
+                    raise ToolError("回读发现 &HEAD 的非 CHID 字段被意外改变；已回滚新副本。")
+                continue
+            if before["fields"] != after["fields"]:
+                raise ToolError(f"回读发现 &{before['record']} 记录字段被意外改变；已回滚新副本。")
+            if source_match_objects[index].group(0) != new_matches[index].group(0):
+                raise ToolError(f"回读发现 &{before['record']} 记录文本被意外改变；已回滚新副本。")
+
+        if hashlib.sha256(source_path.read_bytes()).hexdigest() != source_sha256:
+            raise ToolError("源算例在操作期间发生变化；已回滚新副本。")
+        return {
+            "case_id": new_case_id,
+            "source_id": source_id,
+            "file": created["file"],
+            "source_sha256": source_sha256,
+            "source_unchanged": True,
+            "obstruction_id": obstruction_id,
+            "obstruction": {"record": "OBST", "fields": target_fields},
+            "readback": {"XB": target_fields.get("XB")},
+            "mesh_indices": containing_meshes,
+            "record_count_before": len(source_records),
+            "record_count_after": len(readback["records"]),
+            "sha256": readback["sha256"],
+            "verified": True,
+            "note": ("只替换了一条现有 &OBST 的 XB 值；未修改 ID、SURF 引用或其他字段，"
+                     "也不接受任意 FDS 文本。已验证源文件哈希未变、其他记录未被改动并完成解析回读。"
+                     "未检查与现有障碍物重叠、网格分辨率或物理适用性；未启动求解或 PyroSim，"
+                     "请继续人工审查并执行 preflight。"),
+        }
+    except Exception:
+        # `created` is only set after create_case returns, so this removes just
+        # the copy that this call made and leaves the source and other files alone.
+        destination.unlink(missing_ok=True)
+        raise
+
+
 def run_case(config: dict, case_id: str, approved: bool = False, timeout_seconds: int = 3600, *,
              source_override: Path | None = None, cancel_event: threading.Event | None = None,
              process_callback=None, progress_callback=None) -> dict:
