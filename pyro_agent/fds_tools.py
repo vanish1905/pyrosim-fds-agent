@@ -235,7 +235,7 @@ def inspect_boundary_records(config: dict, case_id: str, record_type: str | None
                         "fields": fields})
     return {"case_id": case_id, "file": case["file"], "sha256": case["sha256"],
             "surface_id_count": len(surface_ids), "records": records,
-            "note": "只读盘点 SURF/VENT/GEOM。type_index 与 edit_boundary_fields 的同类型索引对应；若记录有唯一 ID，也可按 ID 定位。字段名是否受当前 FDS 版本支持仍由 FDS 解析器确认。"}
+            "note": "只读盘点 SURF/VENT/GEOM。type_index 与 preview_boundary_field_edits 的同类型索引对应；若记录有唯一 ID，也可按 ID 定位。字段名是否受当前 FDS 版本支持仍由 FDS 解析器确认。"}
 
 
 def compare_boundary_records(config: dict, case_a: str, case_b: str,
@@ -1431,6 +1431,119 @@ def edit_boundary_fields(config: dict, source_id: str, new_case_id: str,
         if created is not None:
             Path(created["file"]).unlink(missing_ok=True)
         raise
+
+
+def _boundary_preview_root(config: dict) -> Path:
+    return case_root(config) / ".pyro_agent_previews" / "boundary_fields"
+
+
+def preview_boundary_field_edits(config: dict, source_id: str, new_case_id: str,
+                                 record_type: str, updates: dict,
+                                 target_index: int | None = None,
+                                 target_id: str | None = None) -> dict:
+    """Prepare a read-only field diff and persist a short-lived apply token."""
+    import uuid
+
+    _case_id(new_case_id)
+    if record_type not in {"SURF", "VENT"}:
+        raise ToolError("record_type 仅支持 SURF 或 VENT。")
+    if target_index is not None and target_id is not None:
+        raise ToolError("target_index 与 target_id 只能提供其中一个。")
+    if target_id is None and (isinstance(target_index, bool) or not isinstance(target_index, int) or target_index < 1):
+        raise ToolError("必须提供 target_id 或同类型记录的 1 起始 target_index。")
+    if target_id is not None and (not isinstance(target_id, str) or not target_id or len(target_id) > 128
+                                  or any(ord(char) < 32 for char in target_id)):
+        raise ToolError("target_id 必须是 1–128 个字符且不含控制字符。")
+    if not isinstance(updates, dict) or not updates or len(updates) > 20:
+        raise ToolError("updates 必须包含 1–20 个 FDS 字段。")
+
+    source = _case_file(config, source_id)
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    parsed = inspect_case(config, source_id)
+    candidates = [(index, item) for index, item in enumerate(parsed["records"])
+                  if item["record"] == record_type]
+    if target_id is not None:
+        matched = [(index, item) for index, item in candidates if item["fields"].get("ID") == target_id]
+        if len(matched) != 1:
+            raise ToolError(f"target_id 必须唯一匹配一条 &{record_type}.ID；匹配数量：{len(matched)}。")
+        record_index, target = matched[0]
+        target_index = next(i for i, (index, _) in enumerate(candidates, 1) if index == record_index)
+    else:
+        if target_index > len(candidates):
+            raise ToolError(f"源算例只有 {len(candidates)} 条 &{record_type}，target_index={target_index} 不存在。")
+        record_index, target = candidates[target_index - 1]
+    if (case_root(config) / f"{new_case_id}.fds").exists():
+        raise ToolError("目标算例已存在；预览不会覆盖它。")
+
+    changes = []
+    normalized_updates = {}
+    original_body = list(RECORD_RE.finditer(source.read_text(encoding="utf-8-sig")))[record_index].group(2)
+    for field, value in updates.items():
+        if (not isinstance(field, str)
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}(?:\([1-9][0-9]{0,2}\))?", field)):
+            raise ToolError(f"不支持字段名 {field!r}。")
+        normalized = field.upper()
+        base = normalized.split("(", 1)[0]
+        if base in {"ID", "VERTS", "FACES"} or ("(" in normalized and base in {"XB", "SURF_ID"}):
+            raise ToolError(f"不支持修改保护字段 {field!r}。")
+        exists = normalized in target["fields"]
+        if not exists and re.search(rf"\b{re.escape(base)}\s*\(", original_body, re.I):
+            raise ToolError(f"字段 {base} 已有索引式定义；预览不会替换整个数组。")
+        if base == "XB" and (record_type != "VENT" or not exists or "(" in normalized):
+            raise ToolError("XB 只能修改现有 VENT.XB；其他几何使用专用工具。")
+        if base == "SURF_ID" and (record_type != "VENT" or "(" in normalized):
+            raise ToolError("SURF_ID 只能在 VENT 上设置。")
+        formatted, expected = (_typed_fds_value(value, target["fields"][normalized], normalized)
+                               if exists else _new_fds_value(value, normalized))
+        normalized_updates[normalized] = value
+        changes.append({"field": normalized, "action": "replace" if exists else "add",
+                        "before": target["fields"].get(normalized), "after": expected,
+                        "fds_text_preview": formatted})
+
+    resolved_index = target_index
+    preview_id = uuid.uuid4().hex
+    manifest = {"preview_id": preview_id, "created_at": time.time(), "source_id": source_id,
+                "source_sha256": source_hash, "new_case_id": new_case_id,
+                "record_type": record_type,
+                "target_index": None if target_id is not None else target_index,
+                "target_id": target_id, "updates": normalized_updates}
+    preview_root = _boundary_preview_root(config)
+    preview_root.mkdir(parents=True, exist_ok=True)
+    (preview_root / f"{preview_id}.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"preview_id": preview_id, "expires_in_seconds": 3600,
+            "source_id": source_id, "source_sha256": source_hash,
+            "new_case_id": new_case_id, "record_type": record_type,
+            "target": {"type_index": resolved_index, "id": target["fields"].get("ID"),
+                       "fields": target["fields"]},
+            "changes": changes, "ready_to_apply": True,
+            "fds_acceptance": "not_checked; confirmed only by an explicitly approved FDS run",
+            "note": "这是写入前差异预览，不代表 FDS 接受字段或参数具有物理合理性。应用时会重新核对源哈希；只有生成隔离副本，不改源文件。"}
+
+
+def apply_boundary_field_preview(config: dict, preview_id: str) -> dict:
+    """Apply a previously displayed preview only if its source snapshot is unchanged."""
+    if not isinstance(preview_id, str) or not re.fullmatch(r"[a-f0-9]{32}", preview_id):
+        raise ToolError("preview_id 无效。")
+    manifest_path = _boundary_preview_root(config) / f"{preview_id}.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise ToolError("找不到该预览，或预览文件已损坏。请重新生成预览。") from None
+    if time.time() - float(manifest.get("created_at", 0)) > 3600:
+        manifest_path.unlink(missing_ok=True)
+        raise ToolError("预览已过期；请重新生成并展示修改预览。")
+    source = _case_file(config, manifest.get("source_id"))
+    current_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    if current_hash != manifest.get("source_sha256"):
+        raise ToolError("预览后源算例发生变化；为避免应用过期差异，已拒绝写入。请重新生成预览。")
+    result = edit_boundary_fields(config, manifest["source_id"], manifest["new_case_id"],
+                                  manifest["record_type"], manifest["target_index"],
+                                  manifest["updates"], manifest.get("target_id"))
+    manifest_path.unlink(missing_ok=True)
+    return {**result, "preview_id": preview_id,
+            "preview_source_sha256": manifest["source_sha256"],
+            "note": "已按展示过的字段差异写入隔离副本并完成结构回读。FDS 是否接受这些字段仍须由用户确认后的真实求解判断。"}
 
 
 def add_geometry_mesh_to_case(config: dict, source_id: str, new_case_id: str,
