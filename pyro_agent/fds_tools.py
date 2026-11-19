@@ -238,6 +238,72 @@ def inspect_boundary_records(config: dict, case_id: str, record_type: str | None
             "note": "只读盘点 SURF/VENT/GEOM。type_index 与 edit_boundary_fields 的同类型索引对应；若记录有唯一 ID，也可按 ID 定位。字段名是否受当前 FDS 版本支持仍由 FDS 解析器确认。"}
 
 
+def compare_boundary_records(config: dict, case_a: str, case_b: str,
+                              record_type: str | None = None) -> dict:
+    """Compare boundary records between cases without returning full GEOM arrays."""
+    if record_type is not None:
+        record_type = record_type.upper() if isinstance(record_type, str) else record_type
+        if record_type not in {"SURF", "VENT", "GEOM"}:
+            raise ToolError("record_type 仅支持 SURF、VENT 或 GEOM。")
+    left = inspect_boundary_records(config, case_a, record_type)
+    right = inspect_boundary_records(config, case_b, record_type)
+    changes = []
+    types = (record_type,) if record_type else ("SURF", "VENT", "GEOM")
+
+    def keyed(records, kind):
+        selected = [item for item in records if item["record_type"] == kind]
+        counts = {}
+        for item in selected:
+            if item["id"] is not None:
+                counts[item["id"]] = counts.get(item["id"], 0) + 1
+        result = {}
+        for item in selected:
+            key = ("id", item["id"]) if item["id"] is not None and counts[item["id"]] == 1 \
+                else ("index", item["type_index"])
+            result[key] = item
+        return result
+
+    def fields_for(item):
+        fields = item["fields"]
+        if item["record_type"] != "GEOM":
+            return fields
+        summary = {key: value for key, value in fields.items() if key not in {"VERTS", "FACES"}}
+        summary["_mesh_summary"] = {
+            "vertices": len(fields.get("VERTS", [])) // 3,
+            "triangles": len(fields.get("FACES", [])) // 4,
+        }
+        return summary
+
+    for kind in types:
+        a_items, b_items = keyed(left["records"], kind), keyed(right["records"], kind)
+        for key in sorted(a_items.keys() - b_items.keys(), key=repr):
+            item = a_items[key]
+            changes.append({"change": "removed", "record_type": kind, "id": item["id"],
+                            "type_index": item["type_index"], "before": fields_for(item)})
+        for key in sorted(b_items.keys() - a_items.keys(), key=repr):
+            item = b_items[key]
+            changes.append({"change": "added", "record_type": kind, "id": item["id"],
+                            "type_index": item["type_index"], "after": fields_for(item)})
+        for key in sorted(a_items.keys() & b_items.keys(), key=repr):
+            before, after = a_items[key], b_items[key]
+            before_fields, after_fields = fields_for(before), fields_for(after)
+            field_changes = [{"field": field, "before": before_fields.get(field),
+                              "after": after_fields.get(field)}
+                             for field in sorted(before_fields.keys() | after_fields.keys())
+                             if before_fields.get(field) != after_fields.get(field)]
+            if field_changes:
+                changes.append({"change": "modified", "record_type": kind,
+                                "id": after["id"] or before["id"],
+                                "type_index_before": before["type_index"],
+                                "type_index_after": after["type_index"],
+                                "fields": field_changes})
+    return {"case_a": case_a, "sha256_a": left["sha256"],
+            "case_b": case_b, "sha256_b": right["sha256"],
+            "record_type_filter": record_type, "equal": not changes,
+            "change_count": len(changes), "changes": changes,
+            "note": "只比较 SURF/VENT/GEOM namelist。GEOM 的顶点和面数组以计数摘要呈现；相同 ID 优先匹配，否则使用各类型序号。此对比不验证 FDS 物理有效性。"}
+
+
 def compare_case_inputs(config: dict, case_a: str, case_b: str,
                         fields: list[str] | None = None) -> dict:
     """Compare a small set of simulation-critical values between two workspace cases."""
