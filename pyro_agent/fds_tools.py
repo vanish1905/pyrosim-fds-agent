@@ -1327,8 +1327,8 @@ def add_geometry_mesh_to_case(config: dict, source_id: str, new_case_id: str,
     mesh_boxes = [[float(v) for v in mesh] for mesh in meshes]
     for face in faces:
         contained = any(
-            all(all(box[axis] <= transformed[index - 1][axis] <= box[axis + 1]
-                    for axis in (0, 2, 4)) for index in face)
+            all(all(box[box_axis] <= transformed[index - 1][coordinate_axis] <= box[box_axis + 1]
+                    for coordinate_axis, box_axis in enumerate((0, 2, 4))) for index in face)
             for box in mesh_boxes
         )
         if not contained:

@@ -157,6 +157,18 @@ def _run_job(config: dict, workflow_id: str, cancel_event: threading.Event, time
         result = fds_tools.run_case(config, record["case_id"], approved=True, timeout_seconds=timeout_seconds,
                                     source_override=snapshot, cancel_event=cancel_event,
                                     process_callback=register_process, progress_callback=progress)
+        solver_revision = None
+        log_path = result.get("log")
+        if isinstance(log_path, str):
+            try:
+                log_text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+                revision_match = re.search(r"(?im)^\s*Revision\s*:\s*(FDS-[^\s]+)", log_text)
+                solver_revision = revision_match.group(1) if revision_match else None
+            except OSError:
+                solver_revision = None
+        if solver_revision:
+            record["solver_revision"] = solver_revision
+            result["solver_revision"] = solver_revision
         if result.get("cancelled"):
             status, stage = "cancelled", "stopped"
         elif result.get("timeout"):
@@ -169,6 +181,7 @@ def _run_job(config: dict, workflow_id: str, cancel_event: threading.Event, time
                f"工作流 {workflow_id}：" + {"completed": "求解完成", "cancelled": "求解已停止",
                                              "timeout": "求解超时", "failed": "求解失败"}[status],
                finished_at=_now(), result=result, run_dir=result.get("run_dir"),
+               solver_revision=solver_revision or record.get("solver_revision"),
                progress=100.0 if status == "completed" else record.get("progress"),
                error=None if status in {"completed", "cancelled"} else result.get("log_tail"))
     except Exception as exc:
