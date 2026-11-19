@@ -200,6 +200,43 @@ def inspect_case(config: dict, case_id: str) -> dict:
     return {"case_id": case_id, "file": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "records": records}
 
 
+def inspect_boundary_records(config: dict, case_id: str, record_type: str | None = None) -> dict:
+    """Return an addressable inventory of SURF/VENT/GEOM boundaries and references."""
+    if record_type is not None:
+        record_type = record_type.upper() if isinstance(record_type, str) else record_type
+        if record_type not in {"SURF", "VENT", "GEOM"}:
+            raise ToolError("record_type 仅支持 SURF、VENT 或 GEOM。")
+    case = inspect_case(config, case_id)
+    surface_ids = [record["fields"].get("ID") for record in case["records"]
+                   if record["record"] == "SURF" and record["fields"].get("ID")]
+    indexes = {name: 0 for name in ("SURF", "VENT", "GEOM")}
+    records = []
+    for global_index, record in enumerate(case["records"], 1):
+        name = record["record"]
+        if name not in indexes or (record_type is not None and name != record_type):
+            continue
+        indexes[name] += 1
+        fields = record["fields"]
+        identifier = fields.get("ID")
+        reference = fields.get("SURF_ID")
+        if reference is None:
+            reference_state = None
+        elif str(reference).upper() == "OPEN":
+            reference_state = "open"
+        else:
+            matching = sum(1 for value in surface_ids if value == reference)
+            reference_state = "unique" if matching == 1 else "missing" if matching == 0 else "duplicate"
+        records.append({"record_type": name, "type_index": indexes[name], "record_index": global_index,
+                        "id": identifier, "id_unique": bool(identifier) and sum(
+                            1 for item in case["records"] if item["record"] == name
+                            and item["fields"].get("ID") == identifier) == 1,
+                        "surface_id": reference, "surface_reference_state": reference_state,
+                        "fields": fields})
+    return {"case_id": case_id, "file": case["file"], "sha256": case["sha256"],
+            "surface_id_count": len(surface_ids), "records": records,
+            "note": "只读盘点 SURF/VENT/GEOM。type_index 与 edit_boundary_fields 的同类型索引对应；若记录有唯一 ID，也可按 ID 定位。字段名是否受当前 FDS 版本支持仍由 FDS 解析器确认。"}
+
+
 def compare_case_inputs(config: dict, case_a: str, case_b: str,
                         fields: list[str] | None = None) -> dict:
     """Compare a small set of simulation-critical values between two workspace cases."""
@@ -1145,7 +1182,8 @@ def _replace_existing_namelist_field(body: str, field: str, replacement: str) ->
 
 
 def edit_boundary_fields(config: dict, source_id: str, new_case_id: str,
-                         record_type: str, target_index: int, updates: dict) -> dict:
+                         record_type: str, target_index: int | None, updates: dict,
+                         target_id: str | None = None) -> dict:
     """Add/update typed simple fields on one SURF or VENT in a new case copy.
 
     Field names and FDS source are never accepted from arbitrary text. Existing
@@ -1155,8 +1193,13 @@ def edit_boundary_fields(config: dict, source_id: str, new_case_id: str,
 
     if record_type not in {"SURF", "VENT"}:
         raise ToolError("record_type 仅支持 SURF 或 VENT。")
-    if isinstance(target_index, bool) or not isinstance(target_index, int) or target_index < 1:
-        raise ToolError("target_index 是 inspect_case 中同类型记录的 1 起始序号。")
+    if target_index is not None and target_id is not None:
+        raise ToolError("target_index 与 target_id 只能提供其中一个。")
+    if target_id is None and (isinstance(target_index, bool) or not isinstance(target_index, int) or target_index < 1):
+        raise ToolError("必须提供 target_id 或 inspect_case 中同类型记录的 1 起始 target_index。")
+    if target_id is not None and (not isinstance(target_id, str) or not target_id or len(target_id) > 128
+                                  or any(ord(char) < 32 for char in target_id)):
+        raise ToolError("target_id 必须是 1–128 个字符且不含控制字符。")
     if not isinstance(updates, dict) or not updates or len(updates) > 20:
         raise ToolError("updates 必须包含 1–20 个 FDS 字段。")
     normalized_fields = {}
@@ -1173,9 +1216,17 @@ def edit_boundary_fields(config: dict, source_id: str, new_case_id: str,
     original_records = [{"record": m.group(1).upper(), "fields": _parse_namelist_fields(m.group(2))}
                         for m in original_matches]
     candidates = [index for index, item in enumerate(original_records) if item["record"] == record_type]
-    if target_index > len(candidates):
-        raise ToolError(f"源算例只有 {len(candidates)} 条 &{record_type}，target_index={target_index} 不存在。")
-    target_record_index = candidates[target_index - 1]
+    if target_id is not None:
+        matching = [index for index in candidates
+                    if original_records[index]["fields"].get("ID") == target_id]
+        if len(matching) != 1:
+            raise ToolError(f"target_id 必须唯一匹配一条 &{record_type}.ID；匹配数量：{len(matching)}。")
+        target_record_index = matching[0]
+        target_index = candidates.index(target_record_index) + 1
+    else:
+        if target_index > len(candidates):
+            raise ToolError(f"源算例只有 {len(candidates)} 条 &{record_type}，target_index={target_index} 不存在。")
+        target_record_index = candidates[target_index - 1]
     target_before = original_records[target_record_index]
     target_original_body = original_matches[target_record_index].group(2)
     prepared = {}
@@ -1267,7 +1318,8 @@ def edit_boundary_fields(config: dict, source_id: str, new_case_id: str,
         if hashlib.sha256(source.read_bytes()).hexdigest() != source_hash:
             raise ToolError("修改期间源算例发生变化；已回滚。")
         return {"case_id": created["case_id"], "source_id": source_id, "file": created["file"],
-                "record_type": record_type, "target_index": target_index, "updated": changes,
+                "record_type": record_type, "target_index": target_index, "target_id": target_id,
+                "updated": changes,
                 "source_sha256": source_hash, "source_unchanged": True,
                 "sha256": readback["sha256"], "readback_verified": True,
                 "note": "只在新副本中修改 SURF/VENT 字段，允许新增类型明确的数值、布尔、文本或数值数组，但不接受原始 FDS 代码，也不修改 ID/GEOM 拓扑。已有字段保持类型/数组长度；VENT.XB 会校验平面形状/网格范围，VENT.SURF_ID 会校验引用。工具不会验证字段名是否属于当前 FDS 版本，也未穷举字段物理范围；必须执行匹配版本 FDS 的输入检查并由工程师复核，未核验前不要宣称可求解。"}
