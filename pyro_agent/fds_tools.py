@@ -32,7 +32,8 @@ SURFACE_EDITABLE = {
     "THICKNESS": ("THICKNESS", 0.0, 10.0),
 }
 RECORD_RE = re.compile(r"&([A-Z][A-Z0-9_]*)\b(.*?)/", re.I | re.S)
-FIELD_START_RE = re.compile(r"(?<![A-Z0-9_])([A-Z][A-Z0-9_]*)\s*=", re.I)
+FIELD_START_RE = re.compile(
+    r"(?<![A-Z0-9_])([A-Z][A-Z0-9_]*(?:\s*\(\s*[1-9][0-9]{0,2}\s*\))?)\s*=", re.I)
 
 
 class ToolError(ValueError):
@@ -382,7 +383,8 @@ def _parse_namelist_fields(body: str) -> dict:
             continue
         candidate = FIELD_START_RE.match(body, i)
         if candidate:
-            starts.append((candidate.start(1), candidate.end(), candidate.group(1).upper()))
+            starts.append((candidate.start(1), candidate.end(),
+                           re.sub(r"\s+", "", candidate.group(1)).upper()))
             i = candidate.end()
             continue
         i += 1
@@ -473,7 +475,7 @@ def _namelist_field_tokens(body: str) -> list[dict]:
         while value_end < len(body) and body[value_end] not in ",/! \t\r\n":
             value_end += 1
         tokens.append({
-            "key": candidate.group(1).upper(),
+            "key": re.sub(r"\s+", "", candidate.group(1)).upper(),
             "field_start": candidate.start(1),
             "value_span": (value_start, value_end) if value_end > value_start else None,
         })
@@ -1154,7 +1156,8 @@ def _replace_existing_namelist_field(body: str, field: str, replacement: str) ->
             continue
         candidate = FIELD_START_RE.match(body, i)
         if candidate:
-            assignments.append((candidate.group(1).upper(), candidate.start(), candidate.end()))
+            assignments.append((re.sub(r"\s+", "", candidate.group(1)).upper(),
+                                candidate.start(), candidate.end()))
             i = candidate.end()
             continue
         i += 1
@@ -1228,10 +1231,14 @@ def edit_boundary_fields(config: dict, source_id: str, new_case_id: str,
         raise ToolError("updates 必须包含 1–20 个 FDS 字段。")
     normalized_fields = {}
     for field, value in updates.items():
-        if (not isinstance(field, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", field)
-                or field.upper() in {"ID", "VERTS", "FACES"}):
+        if (not isinstance(field, str)
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}(?:\([1-9][0-9]{0,2}\))?", field)):
             raise ToolError(f"不支持字段名 {field!r}；ID 和 GEOM 网格拓扑不能通过此工具修改。")
-        normalized_fields[field.upper()] = value
+        field = field.upper()
+        field_base = field.split("(", 1)[0]
+        if field_base in {"ID", "VERTS", "FACES"} or ("(" in field and field_base in {"XB", "SURF_ID"}):
+            raise ToolError(f"不支持修改保护字段 {field!r}。")
+        normalized_fields[field] = value
 
     source = _case_file(config, source_id)
     source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -1258,13 +1265,14 @@ def edit_boundary_fields(config: dict, source_id: str, new_case_id: str,
         field_exists = field in target_before["fields"]
         if (not field_exists and re.search(rf"\b{re.escape(field)}\s*\(", target_original_body, re.I)):
             raise ToolError(f"字段 {field} 在目标记录中以索引数组形式出现；此工具不修改索引式字段。")
-        if field == "XB" and record_type != "VENT":
+        field_base = field.split("(", 1)[0]
+        if field_base == "XB" and record_type != "VENT":
             raise ToolError("此工具只允许编辑 VENT.XB；实体 OBST.XB 使用专用几何工具。")
-        if field == "SURF_ID" and record_type != "VENT":
+        if field_base == "SURF_ID" and record_type != "VENT":
             raise ToolError("SURF_ID 只能在 VENT 上设置；SURF 记录不能通过此字段建立引用。")
-        if field == "XB" and not field_exists:
+        if field_base == "XB" and not field_exists:
             raise ToolError("目标 VENT 当前没有 XB；请使用专用通风口工具创建几何，不在此处混加字段。")
-        if field == "XB" and record_type == "VENT":
+        if field_base == "XB" and record_type == "VENT":
             if not isinstance(value, list) or len(value) != 6 or any(
                     isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in value):
                 raise ToolError("VENT.XB 必须是 6 个有限数值。")
@@ -1310,7 +1318,7 @@ def edit_boundary_fields(config: dict, source_id: str, new_case_id: str,
                             "action": "replaced" if field in target_before["fields"] else "added"})
         if set(target_after["fields"]) != set(target_before["fields"]) | set(prepared):
             raise ToolError("目标 FDS 记录字段集合与请求不一致；已回滚。")
-        if record_type == "VENT" and "SURF_ID" in prepared:
+        if record_type == "VENT" and any(field.split("(", 1)[0] == "SURF_ID" for field in prepared):
             ref = target_after["fields"].get("SURF_ID")
             if (not isinstance(ref, str) or (ref.upper() != "OPEN" and sum(
                     1 for record in original_records
