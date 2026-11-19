@@ -879,6 +879,538 @@ def add_obstruction_to_case(config: dict, source_id: str, new_case_id: str, xb: 
         raise
 
 
+def _parse_surface_mesh(path: Path) -> tuple[list[tuple[float, float, float]], list[tuple[int, int, int]]]:
+    """Read a bounded OBJ or STL triangle mesh without loading third-party code."""
+    import math
+    import struct
+
+    if path.stat().st_size > 50 * 1024 * 1024:
+        raise ToolError("CAD 网格文件超过 50 MiB 限制。")
+    vertices: list[tuple[float, float, float]] = []
+    faces: list[tuple[int, int, int]] = []
+
+    def vertex_index(point):
+        point = tuple(float(v) for v in point)
+        if len(point) != 3 or not all(math.isfinite(v) for v in point):
+            raise ToolError("网格包含非有限或非三维顶点。")
+        vertices.append(point)
+        return len(vertices)
+
+    def add_polygon(indices):
+        if len(indices) != 3:
+            raise ToolError("OBJ 必须已三角化；请在 CAD/BIM 工具中先三角化再导出，以避免改变多边形边界。")
+        faces.append(tuple(indices))
+        if len(faces) > 20000:
+            raise ToolError("CAD 网格三角面超过 20,000 个限制；请在 CAD 工具中先简化网格。")
+
+    if path.suffix.lower() == ".obj":
+        source_vertices = []
+        try:
+            for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+                parts = line.partition("#")[0].split()
+                if not parts:
+                    continue
+                if parts[0] == "v":
+                    if len(parts) < 4:
+                        raise ToolError(f"OBJ 第 {line_number} 行的 v 记录缺少坐标。")
+                    point = tuple(float(v) for v in parts[1:4])
+                    if not all(math.isfinite(v) for v in point):
+                        raise ToolError(f"OBJ 第 {line_number} 行含非有限坐标。")
+                    source_vertices.append(point)
+                    if len(source_vertices) > 10000:
+                        raise ToolError("CAD 网格顶点超过 10,000 个限制；请先简化网格。")
+                elif parts[0] == "f":
+                    indexes = []
+                    for item in parts[1:]:
+                        raw = item.split("/", 1)[0]
+                        index = int(raw)
+                        if index == 0:
+                            raise ToolError(f"OBJ 第 {line_number} 行包含非法的 0 起始顶点索引。")
+                        index = index - 1 if index > 0 else len(source_vertices) + index
+                        if index < 0 or index >= len(source_vertices):
+                            raise ToolError(f"OBJ 第 {line_number} 行的面引用了不存在的顶点。")
+                        indexes.append(index + 1)
+                    add_polygon(indexes)
+        except (UnicodeError, ValueError, OverflowError) as exc:
+            raise ToolError(f"无法解析 OBJ 网格：{exc}") from None
+        used = sorted({index for face in faces for index in face})
+        remap = {old: new for new, old in enumerate(used, 1)}
+        vertices = [source_vertices[index - 1] for index in used]
+        faces = [tuple(remap[index] for index in face) for face in faces]
+    else:
+        raw = path.read_bytes()
+        triangles = []
+        if len(raw) >= 84:
+            count = struct.unpack_from("<I", raw, 80)[0]
+            if 84 + count * 50 == len(raw):
+                for offset in range(84, len(raw), 50):
+                    values = struct.unpack_from("<12fH", raw, offset)
+                    triangles.append((values[3:6], values[6:9], values[9:12]))
+        if not triangles:
+            try:
+                text = raw.decode("ascii")
+                current = []
+                for line in text.splitlines():
+                    parts = line.strip().split()
+                    if parts and parts[0].lower() == "vertex":
+                        if len(parts) != 4:
+                            raise ToolError("ASCII STL vertex 必须包含 3 个坐标。")
+                        current.append(tuple(float(v) for v in parts[1:]))
+                        if len(current) == 3:
+                            triangles.append(tuple(current))
+                            current = []
+                if current:
+                    raise ToolError("ASCII STL 的 facet 顶点数量不是 3 的倍数。")
+            except (UnicodeError, ValueError, OverflowError):
+                raise ToolError("无法识别为有效的二进制或 ASCII STL 网格。") from None
+        if not triangles or len(triangles) > 20000:
+            raise ToolError("STL 网格为空或超过 20,000 个三角面限制。")
+        deduplicated = {}
+        for triangle in triangles:
+            face = []
+            for point in triangle:
+                key = tuple(float(v) for v in point)
+                if len(key) != 3 or not all(math.isfinite(v) for v in key):
+                    raise ToolError("STL 网格包含非有限或非三维顶点。")
+                if key not in deduplicated:
+                    deduplicated[key] = len(vertices) + 1
+                    vertices.append(key)
+                face.append(deduplicated[key])
+            faces.append(tuple(face))
+        if len(vertices) > 10000:
+            raise ToolError("CAD 网格顶点超过 10,000 个限制；请先简化网格。")
+
+    if not vertices or not faces or len(vertices) > 10000:
+        raise ToolError("网格没有有效三角面，或顶点超过 10,000 个限制。")
+    # Closed, consistently wound manifold is a useful minimum for an imported solid.
+    edges = {}
+    signed_volume = 0.0
+    origin = vertices[0]
+    for a, b, c in faces:
+        if len({a, b, c}) != 3:
+            raise ToolError("CAD 网格包含重复顶点的退化三角面。")
+        pa, pb, pc = (vertices[index - 1] for index in (a, b, c))
+        cross = ((pb[1]-pa[1])*(pc[2]-pa[2])-(pb[2]-pa[2])*(pc[1]-pa[1]),
+                 (pb[2]-pa[2])*(pc[0]-pa[0])-(pb[0]-pa[0])*(pc[2]-pa[2]),
+                 (pb[0]-pa[0])*(pc[1]-pa[1])-(pb[1]-pa[1])*(pc[0]-pa[0]))
+        if sum(value * value for value in cross) <= 1e-24:
+            raise ToolError("CAD 网格包含面积为零的退化三角面。")
+        pa0, pb0, pc0 = (tuple(point[axis] - origin[axis] for axis in range(3))
+                         for point in (pa, pb, pc))
+        signed_volume += (pa0[0] * (pb0[1] * pc0[2] - pb0[2] * pc0[1])
+                          + pa0[1] * (pb0[2] * pc0[0] - pb0[0] * pc0[2])
+                          + pa0[2] * (pb0[0] * pc0[1] - pb0[1] * pc0[0])) / 6.0
+        for start, end in ((a, b), (b, c), (c, a)):
+            key = (min(start, end), max(start, end))
+            direction = 1 if start < end else -1
+            count, winding = edges.get(key, (0, 0))
+            edges[key] = (count + 1, winding + direction)
+    if any(count != 2 or winding != 0 for count, winding in edges.values()):
+        raise ToolError("CAD 网格必须是闭合、边流形且面绕序一致的三角面实体；请在 CAD/BIM 软件中修复后导出 OBJ/STL。")
+    if not math.isfinite(signed_volume) or abs(signed_volume) < 1e-18:
+        raise ToolError("CAD 网格包围体积无效或为零。")
+    if signed_volume < 0:
+        faces = [(a, c, b) for a, b, c in faces]
+    return vertices, faces
+
+
+def _typed_fds_value(value, original, field: str) -> tuple[str, object]:
+    """Format a JSON primitive/list while preserving the existing FDS value type."""
+    import math
+
+    def scalar(new, old):
+        if isinstance(old, bool):
+            if not isinstance(new, bool):
+                raise ToolError(f"{field} 原值是布尔值，新值也必须是布尔值。")
+            return (".TRUE." if new else ".FALSE."), new
+        if isinstance(old, (int, float)) and not isinstance(old, bool):
+            if isinstance(new, bool) or not isinstance(new, (int, float)) or not math.isfinite(new):
+                raise ToolError(f"{field} 原值是数值，新值必须是有限数值。")
+            numeric = int(new) if isinstance(old, int) and float(new).is_integer() else float(new)
+            return repr(numeric), numeric
+        if isinstance(old, str):
+            if (not isinstance(new, str) or any(ord(char) < 32 for char in new)
+                    or len(new) > 256):
+                raise ToolError(f"{field} 原值是文本；新值必须是最多 256 字符且不含控制字符的文本。")
+            return "'" + new.replace("'", "''") + "'", new
+        raise ToolError(f"{field} 的现有 FDS 值类型暂不支持。")
+
+    if isinstance(original, list):
+        if not isinstance(value, list) or len(value) != len(original) or not original:
+            raise ToolError(f"{field} 必须保持为长度 {len(original)} 的数组。")
+        values = [scalar(item, before) for item, before in zip(value, original)]
+        if any("'" in item[0] or item[0] in {".TRUE.", ".FALSE."} for item in values):
+            raise ToolError(f"{field} 的数组类型不支持字符串或布尔值。")
+        return ",".join(item[0] for item in values), [item[1] for item in values]
+    return scalar(value, original)
+
+
+def _new_fds_value(value, field: str) -> tuple[str, object]:
+    """Serialize a primitive/list safely; never accept raw FDS expressions."""
+    import math
+
+    if isinstance(value, bool):
+        return (".TRUE." if value else ".FALSE."), value
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            raise ToolError(f"{field} 必须是有限数值。")
+        return repr(value), value
+    if isinstance(value, str):
+        if not value or len(value) > 256 or any(ord(char) < 32 for char in value):
+            raise ToolError(f"{field} 文本必须为 1–256 字符且不含控制字符。")
+        return "'" + value.replace("'", "''") + "'", value
+    if isinstance(value, list):
+        if not value or len(value) > 64 or any(
+                isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item)
+                for item in value):
+            raise ToolError(f"{field} 新增数组只支持 1–64 个有限数值。")
+        return ",".join(repr(item) for item in value), value
+    raise ToolError(f"{field} 只支持数值、布尔、文本或有限数值数组。")
+
+
+def _replace_existing_namelist_field(body: str, field: str, replacement: str) -> str:
+    """Replace one existing simple field value, preserving its surrounding record text."""
+    assignments = []
+    quote = None
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if quote:
+            if ch == quote:
+                if i + 1 < len(body) and body[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            i += 1
+            continue
+        if ch == "!":
+            newline = body.find("\n", i)
+            i = len(body) if newline < 0 else newline + 1
+            continue
+        candidate = FIELD_START_RE.match(body, i)
+        if candidate:
+            assignments.append((candidate.group(1).upper(), candidate.start(), candidate.end()))
+            i = candidate.end()
+            continue
+        i += 1
+    matches = [(index, item) for index, item in enumerate(assignments) if item[0] == field]
+    if len(matches) != 1:
+        raise ToolError(f"目标 FDS 记录中的 {field} 字段出现 {len(matches)} 次，必须恰好出现一次。")
+    index, (_, _, value_start) = matches[0]
+    limit = assignments[index + 1][1] if index + 1 < len(assignments) else len(body)
+    while value_start < limit and body[value_start].isspace():
+        value_start += 1
+    quote = None
+    comment = False
+    last_data = None
+    i = value_start
+    while i < limit:
+        ch = body[i]
+        if comment:
+            if ch == "\n":
+                comment = False
+            i += 1
+            continue
+        if quote:
+            if ch == quote:
+                if i + 1 < limit and body[i + 1] == quote:
+                    i += 2
+                    last_data = i
+                    continue
+                quote = None
+            i += 1
+            last_data = i
+            continue
+        if ch in "'\"":
+            quote = ch
+            i += 1
+            last_data = i
+            continue
+        if ch == "!":
+            comment = True
+            i += 1
+            continue
+        if not ch.isspace() and ch != ",":
+            i += 1
+            last_data = i
+            continue
+        i += 1
+    if last_data is None:
+        raise ToolError(f"目标 FDS 字段 {field} 没有可替换的值。")
+    return body[:value_start] + replacement + body[last_data:]
+
+
+def edit_boundary_fields(config: dict, source_id: str, new_case_id: str,
+                         record_type: str, target_index: int, updates: dict) -> dict:
+    """Add/update typed simple fields on one SURF or VENT in a new case copy.
+
+    Field names and FDS source are never accepted from arbitrary text. Existing
+    simple fields keep their type; new fields use only JSON primitive values.
+    """
+    import math
+
+    if record_type not in {"SURF", "VENT"}:
+        raise ToolError("record_type 仅支持 SURF 或 VENT。")
+    if isinstance(target_index, bool) or not isinstance(target_index, int) or target_index < 1:
+        raise ToolError("target_index 是 inspect_case 中同类型记录的 1 起始序号。")
+    if not isinstance(updates, dict) or not updates or len(updates) > 20:
+        raise ToolError("updates 必须包含 1–20 个 FDS 字段。")
+    normalized_fields = {}
+    for field, value in updates.items():
+        if (not isinstance(field, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", field)
+                or field.upper() in {"ID", "VERTS", "FACES"}):
+            raise ToolError(f"不支持字段名 {field!r}；ID 和 GEOM 网格拓扑不能通过此工具修改。")
+        normalized_fields[field.upper()] = value
+
+    source = _case_file(config, source_id)
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    original_text = source.read_text(encoding="utf-8-sig")
+    original_matches = list(RECORD_RE.finditer(original_text))
+    original_records = [{"record": m.group(1).upper(), "fields": _parse_namelist_fields(m.group(2))}
+                        for m in original_matches]
+    candidates = [index for index, item in enumerate(original_records) if item["record"] == record_type]
+    if target_index > len(candidates):
+        raise ToolError(f"源算例只有 {len(candidates)} 条 &{record_type}，target_index={target_index} 不存在。")
+    target_record_index = candidates[target_index - 1]
+    target_before = original_records[target_record_index]
+    target_original_body = original_matches[target_record_index].group(2)
+    prepared = {}
+    for field, value in normalized_fields.items():
+        field_exists = field in target_before["fields"]
+        if (not field_exists and re.search(rf"\b{re.escape(field)}\s*\(", target_original_body, re.I)):
+            raise ToolError(f"字段 {field} 在目标记录中以索引数组形式出现；此工具不修改索引式字段。")
+        if field == "XB" and record_type != "VENT":
+            raise ToolError("此工具只允许编辑 VENT.XB；实体 OBST.XB 使用专用几何工具。")
+        if field == "SURF_ID" and record_type != "VENT":
+            raise ToolError("SURF_ID 只能在 VENT 上设置；SURF 记录不能通过此字段建立引用。")
+        if field == "XB" and not field_exists:
+            raise ToolError("目标 VENT 当前没有 XB；请使用专用通风口工具创建几何，不在此处混加字段。")
+        if field == "XB" and record_type == "VENT":
+            if not isinstance(value, list) or len(value) != 6 or any(
+                    isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in value):
+                raise ToolError("VENT.XB 必须是 6 个有限数值。")
+            if any(value[i] >= value[i + 1] for i in (0, 2, 4)) or sum(
+                    value[i] == value[i + 1] for i in (0, 2, 4)) != 1:
+                raise ToolError("VENT.XB 必须恰好有一个轴厚度为零，另外两轴宽度必须大于零。")
+            meshes = [r["fields"].get("XB") for r in original_records if r["record"] == "MESH"]
+            valid_meshes = [mesh for mesh in meshes if isinstance(mesh, list) and len(mesh) == 6
+                            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                                    and math.isfinite(v) for v in mesh)
+                            and all(mesh[axis] < mesh[axis + 1] for axis in (0, 2, 4))]
+            if not any(all(mesh[axis] <= value[axis] and value[axis + 1] <= mesh[axis + 1]
+                           for axis in (0, 2, 4)) for mesh in valid_meshes):
+                raise ToolError("VENT.XB 必须完整位于至少一个源 MESH.XB 内。")
+        prepared[field] = (_typed_fds_value(value, target_before["fields"][field], field)
+                           if field_exists else _new_fds_value(value, field))
+
+    created = None
+    try:
+        created = create_case(config, source_id, new_case_id)
+        destination = Path(created["file"])
+        text = destination.read_text(encoding="utf-8-sig")
+        matches = list(RECORD_RE.finditer(text))
+        target_match = matches[target_record_index]
+        body = target_match.group(2)
+        for field, (formatted, _) in prepared.items():
+            if field in target_before["fields"]:
+                body = _replace_existing_namelist_field(body, field, formatted)
+            else:
+                body = _replace_or_append_scalar_field(body, field, formatted)
+        text = text[:target_match.start(2)] + body + text[target_match.end(2):]
+        destination.write_text(text, encoding="utf-8")
+        readback = inspect_case(config, created["case_id"])
+        target_after = readback["records"][target_record_index]
+        if target_after["record"] != record_type:
+            raise ToolError("副本中的目标记录顺序发生变化；已回滚。")
+        changes = []
+        for field, (formatted, expected) in prepared.items():
+            actual = target_after["fields"].get(field)
+            if actual != expected:
+                raise ToolError(f"{field} 写入回读不一致：期望 {expected!r}，实际 {actual!r}；已回滚。")
+            changes.append({"field": field, "before": target_before["fields"].get(field), "after": actual,
+                            "action": "replaced" if field in target_before["fields"] else "added"})
+        if set(target_after["fields"]) != set(target_before["fields"]) | set(prepared):
+            raise ToolError("目标 FDS 记录字段集合与请求不一致；已回滚。")
+        if record_type == "VENT" and "SURF_ID" in prepared:
+            ref = target_after["fields"].get("SURF_ID")
+            if (not isinstance(ref, str) or (ref.upper() != "OPEN" and sum(
+                    1 for record in original_records
+                    if record["record"] == "SURF" and record["fields"].get("ID") == ref) != 1)):
+                raise ToolError("VENT.SURF_ID 必须精确引用源算例中唯一一条现有 &SURF.ID；已回滚。")
+        expected_records = len(original_records)
+        if len(readback["records"]) != expected_records:
+            raise ToolError("更新边界字段时 FDS 记录数量变化；已回滚。")
+        new_matches = list(RECORD_RE.finditer(destination.read_text(encoding="utf-8-sig")))
+        if len(new_matches) != len(original_matches):
+            raise ToolError("保存后 FDS 记录边界发生变化；已回滚。")
+        for index, (before, after) in enumerate(zip(original_records, readback["records"])):
+            if index == target_record_index:
+                for key, value in before["fields"].items():
+                    if key not in prepared and after["fields"].get(key) != value:
+                        raise ToolError(f"目标 &{record_type} 的非目标字段 {key} 改变；已回滚。")
+                continue
+            if before["record"] == "HEAD":
+                before_fields, after_fields = dict(before["fields"]), dict(after["fields"])
+                before_fields.pop("CHID", None)
+                after_fields.pop("CHID", None)
+                if before_fields != after_fields:
+                    raise ToolError("副本中 HEAD.CHID 以外字段被意外改变；已回滚。")
+            elif before["fields"] != after["fields"]:
+                raise ToolError(f"副本中的 &{before['record']} 非目标记录被意外改变；已回滚。")
+            if index != target_record_index and before["record"] != "HEAD":
+                if original_matches[index].group(0) != new_matches[index].group(0):
+                    raise ToolError(f"副本中的非目标 &{before['record']} 文本被意外改变；已回滚。")
+        if hashlib.sha256(source.read_bytes()).hexdigest() != source_hash:
+            raise ToolError("修改期间源算例发生变化；已回滚。")
+        return {"case_id": created["case_id"], "source_id": source_id, "file": created["file"],
+                "record_type": record_type, "target_index": target_index, "updated": changes,
+                "source_sha256": source_hash, "source_unchanged": True,
+                "sha256": readback["sha256"], "readback_verified": True,
+                "note": "只在新副本中修改 SURF/VENT 字段，允许新增类型明确的数值、布尔、文本或数值数组，但不接受原始 FDS 代码，也不修改 ID/GEOM 拓扑。已有字段保持类型/数组长度；VENT.XB 会校验平面形状/网格范围，VENT.SURF_ID 会校验引用。工具不会验证字段名是否属于当前 FDS 版本，也未穷举字段物理范围；必须执行匹配版本 FDS 的输入检查并由工程师复核，未核验前不要宣称可求解。"}
+    except Exception:
+        if created is not None:
+            Path(created["file"]).unlink(missing_ok=True)
+        raise
+
+
+def add_geometry_mesh_to_case(config: dict, source_id: str, new_case_id: str,
+                              mesh_file: str, geometry_id: str, surface_id: str,
+                              scale: float = 1.0, translation: list[float] | None = None) -> dict:
+    """Import one closed OBJ/STL solid into FDS GEOM on a new case copy."""
+    import math
+
+    root = case_root(config).resolve()
+    if (not isinstance(mesh_file, str) or Path(mesh_file).is_absolute()
+            or Path(mesh_file).name != mesh_file or mesh_file in {".", ".."}):
+        raise ToolError("mesh_file 必须是算例工作区根目录中 OBJ/STL 文件名。")
+    asset_path = (root / mesh_file).resolve()
+    if asset_path.parent != root or not asset_path.is_file() or asset_path.suffix.lower() not in {".obj", ".stl"}:
+        raise ToolError("仅支持算例工作区根目录中的 .obj 或 .stl 文件，禁止路径越界。")
+    if not isinstance(geometry_id, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", geometry_id):
+        raise ToolError("geometry_id 只能以字母开头，并包含最多 32 个字母、数字、_ 或 -。")
+    if not isinstance(surface_id, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", surface_id):
+        raise ToolError("surface_id 只能以字母开头，并包含最多 32 个字母、数字、_ 或 -。")
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0 or scale > 10000:
+        raise ToolError("scale 必须是 (0, 10000] 范围内的有限正数。")
+    if translation is None:
+        translation = [0.0, 0.0, 0.0]
+    if (not isinstance(translation, list) or len(translation) != 3
+            or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in translation)):
+        raise ToolError("translation 必须是 3 个有限数值组成的数组，单位 m。")
+
+    mesh_sha = hashlib.sha256(asset_path.read_bytes()).hexdigest()
+    vertices, faces = _parse_surface_mesh(asset_path)
+    transformed = [tuple(float(f"{float(value) * float(scale) + float(translation[axis]):.12g}")
+                         for axis, value in enumerate(vertex)) for vertex in vertices]
+    source_path = _case_file(config, source_id)
+    source_sha = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    source_text = source_path.read_text(encoding="utf-8-sig")
+    source_matches = list(RECORD_RE.finditer(source_text))
+    source_records = [{"record": m.group(1).upper(), "fields": _parse_namelist_fields(m.group(2))} for m in source_matches]
+    surfaces = [r for r in source_records if r["record"] == "SURF" and r["fields"].get("ID") == surface_id]
+    if len(surfaces) != 1:
+        raise ToolError(f"surface_id 必须唯一匹配现有 &SURF.ID；匹配数量：{len(surfaces)}。")
+    if any(r["record"] == "GEOM" and r["fields"].get("ID") == geometry_id for r in source_records):
+        raise ToolError(f"源算例已存在 geometry_id={geometry_id!r}。")
+    meshes = [r["fields"].get("XB") for r in source_records if r["record"] == "MESH"]
+    if not meshes:
+        raise ToolError("源算例没有 &MESH，无法验证 CAD 网格位置。")
+    for mesh in meshes:
+        if (not isinstance(mesh, list) or len(mesh) != 6
+                or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in mesh)
+                or any(mesh[i] >= mesh[i + 1] for i in (0, 2, 4))):
+            raise ToolError("源算例含缺失/无效的 MESH.XB；无法安全导入 CAD 网格。")
+    mesh_boxes = [[float(v) for v in mesh] for mesh in meshes]
+    for face in faces:
+        contained = any(
+            all(all(box[axis] <= transformed[index - 1][axis] <= box[axis + 1]
+                    for axis in (0, 2, 4)) for index in face)
+            for box in mesh_boxes
+        )
+        if not contained:
+            raise ToolError("导入网格的每个三角面都必须完整位于同一个源 MESH.XB 内。")
+
+    vert_rows = [", ".join(f"{value:.12g}" for value in vertex) for vertex in transformed]
+    face_rows = [", ".join(str(value) for value in (*face, 1)) for face in faces]
+    geom_text = (f"&GEOM ID='{geometry_id}', SURF_ID='{surface_id}', VERTS=\n"
+                 + ",\n".join(vert_rows) + ",\nFACES=\n"
+                 + ",\n".join(face_rows) + " /\n")
+    created = None
+    try:
+        created = create_case(config, source_id, new_case_id)
+        dest = Path(created["file"])
+        text = dest.read_text(encoding="utf-8-sig")
+        tail = re.search(r"(?im)^\s*&TAIL\b", text)
+        text = (text[:tail.start()] + geom_text + "\n" + text[tail.start():]) if tail else text.rstrip() + "\n" + geom_text + "\n"
+        dest.write_text(text, encoding="utf-8")
+        readback = inspect_case(config, new_case_id)
+        new_matches = list(RECORD_RE.finditer(dest.read_text(encoding="utf-8-sig")))
+        source_tail_index = next((i for i, record in enumerate(source_records)
+                                  if record["record"] == "TAIL"), len(source_records))
+        geom_index = source_tail_index
+        geoms = [r for r in readback["records"] if r["record"] == "GEOM" and r["fields"].get("ID") == geometry_id]
+        source_geom_count = sum(1 for r in source_records if r["record"] == "GEOM")
+        if (len(geoms) != 1 or geoms[0]["fields"].get("SURF_ID") != surface_id
+                or geoms[0]["fields"].get("VERTS") != [v for vertex in transformed for v in vertex]
+                or geoms[0]["fields"].get("FACES") != [v for face in faces for v in (*face, 1)]
+                or sum(1 for r in readback["records"] if r["record"] == "GEOM") != source_geom_count + 1
+                or len(readback["records"]) != len(source_records) + 1
+                or len(new_matches) != len(source_matches) + 1
+                or readback["records"][geom_index]["record"] != "GEOM"
+                or readback["records"][geom_index]["fields"].get("ID") != geometry_id):
+            raise ToolError("CAD 网格写入后回读不一致，已删除新副本。")
+        for index, before in enumerate(source_records):
+            after_index = index if index < geom_index else index + 1
+            after = readback["records"][after_index]
+            if before["record"] == "HEAD":
+                old_fields, new_fields = dict(before["fields"]), dict(after["fields"])
+                old_fields.pop("CHID", None)
+                new_fields.pop("CHID", None)
+                if old_fields != new_fields:
+                    raise ToolError("CAD 导入时副本中 HEAD.CHID 以外字段被改变；已回滚。")
+                continue
+            if before["fields"] != after["fields"]:
+                raise ToolError(f"CAD 导入时副本中的非目标 &{before['record']} 字段被改变；已回滚。")
+            if source_matches[index].group(0) != new_matches[after_index].group(0):
+                raise ToolError(f"CAD 导入时副本中的非目标 &{before['record']} 文本被改变；已回滚。")
+        if hashlib.sha256(source_path.read_bytes()).hexdigest() != source_sha:
+            raise ToolError("导入期间源算例发生变化，已删除新副本。")
+        if hashlib.sha256(asset_path.read_bytes()).hexdigest() != mesh_sha:
+            raise ToolError("CAD 网格在导入期间发生变化，已删除新副本。")
+        return {"case_id": new_case_id, "source_id": source_id, "file": created["file"],
+                "source_sha256": source_sha, "source_unchanged": True,
+                "mesh_file": str(asset_path), "mesh_sha256": mesh_sha,
+                "format": asset_path.suffix.lower(), "geometry_id": geometry_id, "surface_id": surface_id,
+                "vertices": len(transformed), "triangles": len(faces), "scale": float(scale),
+                "translation": translation, "readback_verified": True,
+                "note": "已把闭合三角网格写为 FDS &GEOM VERTS/FACES 并在副本中回读。未检查自交、碰撞、材料适用性或网格质量；OBJ 材质组/IFC 构件属性不保留。需执行 FDS preflight 并由工程师检查。"}
+    except Exception:
+        if created is not None:
+            Path(created["file"]).unlink(missing_ok=True)
+        raise
+
+
+def list_geometry_assets(config: dict) -> dict:
+    """List direct-workspace OBJ/STL files that can be imported by the mesh tool."""
+    root = case_root(config).resolve()
+    assets = []
+    candidates = {path.resolve() for pattern in ("*.obj", "*.stl") for path in root.glob(pattern)}
+    for resolved in sorted(candidates, key=lambda item: item.name.casefold()):
+        if resolved.parent != root or not resolved.is_file():
+            continue
+        size = resolved.stat().st_size
+        assets.append({"mesh_file": resolved.name, "format": resolved.suffix.lower(),
+                       "bytes": size, "within_size_limit": size <= 50 * 1024 * 1024})
+        if len(assets) >= 200:
+            break
+    return {"case_root": str(root), "assets": assets,
+            "note": "只列工作区根目录中最多 200 个 OBJ/STL；不读取网格几何、不递归子目录。"}
+
+
 def add_vent_to_case(config: dict, source_id: str, new_case_id: str, xb: list[float],
                      surface_id: str) -> dict:
     """Clone a case and append one XB+SURF_ID-only axis-aligned &VENT.
