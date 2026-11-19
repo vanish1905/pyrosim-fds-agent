@@ -879,6 +879,161 @@ def add_obstruction_to_case(config: dict, source_id: str, new_case_id: str, xb: 
         raise
 
 
+def add_vent_to_case(config: dict, source_id: str, new_case_id: str, xb: list[float],
+                     surface_id: str) -> dict:
+    """Clone a case and append one XB+SURF_ID-only axis-aligned &VENT.
+
+    The edit surface is intentionally narrow: the record contains only six
+    numeric plane bounds and a reference to one existing SURF ID. Exactly one
+    axis must have zero thickness; the plane must fit inside one source MESH.XB
+    domain. No arbitrary fields or FDS text are accepted, and any failure
+    removes only the copy made by this call.
+    """
+    import math
+
+    invalid_xb = "xb 必须是 6 个有限数值：[xmin,xmax,ymin,ymax,zmin,zmax]。"
+    if not isinstance(xb, list) or len(xb) != 6:
+        raise ToolError(invalid_xb)
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in xb):
+        raise ToolError(invalid_xb)
+    try:
+        coords = [float(value) for value in xb]
+    except (OverflowError, ValueError):
+        raise ToolError(invalid_xb) from None
+    if not all(math.isfinite(value) for value in coords):
+        raise ToolError(invalid_xb)
+    if any(coords[i] > coords[i + 1] for i in (0, 2, 4)):
+        raise ToolError("xb 每个轴的最小值都必须小于等于最大值。")
+    zero_axes = [i for i in (0, 2, 4) if coords[i] == coords[i + 1]]
+    if len(zero_axes) != 1:
+        raise ToolError("xb 必须恰好在一个轴上厚度为零，另外两个轴的宽度必须大于零。")
+
+    if not isinstance(surface_id, str) or not surface_id or len(surface_id) > 128:
+        raise ToolError("surface_id 必须是非空字符串，用于精确匹配已有 &SURF.ID。")
+    if any(char in surface_id for char in "'\"/,!") or any(ord(char) < 32 for char in surface_id):
+        raise ToolError("surface_id 含有无法安全写入 FDS 记录的字符。")
+
+    new_case_id = _case_id(new_case_id)
+    source_path = _case_file(config, source_id)
+    source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    source_text = source_path.read_text(encoding="utf-8-sig")
+    source_match_objects = list(RECORD_RE.finditer(source_text))
+    source_records = [{"record": match.group(1).upper(),
+                       "fields": _parse_namelist_fields(match.group(2))}
+                      for match in source_match_objects]
+
+    matching_surfaces = [record for record in source_records
+                         if record["record"] == "SURF" and record["fields"].get("ID") == surface_id]
+    if not matching_surfaces:
+        raise ToolError(f"源算例中找不到 ID 为 {surface_id!r} 的 &SURF 记录。")
+    if len(matching_surfaces) > 1:
+        raise ToolError(f"源算例中存在 {len(matching_surfaces)} 条 ID 为 {surface_id!r} 的 &SURF 记录，"
+                        "无法确定唯一引用。")
+
+    source_meshes = [record["fields"] for record in source_records if record["record"] == "MESH"]
+    if not source_meshes:
+        raise ToolError("源算例没有 &MESH 记录，无法验证通风平面是否位于计算域内。")
+    mesh_domains = []
+    for index, fields in enumerate(source_meshes, 1):
+        mesh_xb = fields.get("XB")
+        valid = (isinstance(mesh_xb, list) and len(mesh_xb) == 6
+                 and all(not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v)
+                         for v in mesh_xb)
+                 and all(float(mesh_xb[i]) < float(mesh_xb[i + 1]) for i in (0, 2, 4)))
+        if not valid:
+            raise ToolError(f"源算例第 {index} 个 &MESH 的 XB 缺失或无效，无法安全验证通风平面范围。")
+        mesh_domains.append([float(v) for v in mesh_xb])
+    containing_meshes = [index for index, domain in enumerate(mesh_domains, 1)
+                         if all(domain[i] <= coords[i] and coords[i + 1] <= domain[i + 1] for i in (0, 2, 4))]
+    if not containing_meshes:
+        raise ToolError("通风平面必须完整位于至少一个源 &MESH.XB 范围内（边界可重合）。")
+
+    destination = case_root(config) / f"{new_case_id}.fds"
+    if destination.exists():
+        raise ToolError("目标算例已存在；请使用新的 case_id。")
+    created = None
+    try:
+        created = create_case(config, source_id, new_case_id)
+        destination = Path(created["file"])
+        text = destination.read_text(encoding="utf-8-sig")
+        record_text = ("&VENT XB=" + ",".join(repr(value) for value in coords)
+                       + f", SURF_ID='{surface_id}' /")
+        tail = re.search(r"(?im)^\s*&TAIL\b", text)
+        insertion = record_text + "\n"
+        if tail:
+            text = text[:tail.start()] + insertion + text[tail.start():]
+        else:
+            text = text.rstrip() + "\n" + insertion
+        destination.write_text(text, encoding="utf-8")
+
+        readback = inspect_case(config, new_case_id)
+        new_matches = list(RECORD_RE.finditer(destination.read_text(encoding="utf-8-sig")))
+        if len(readback["records"]) != len(source_records) + 1:
+            raise ToolError("回读发现 FDS 记录数量不是源算例加一；已回滚新副本。")
+        if len(new_matches) != len(source_match_objects) + 1:
+            raise ToolError("回读发现 FDS 记录边界数量不是源算例加一；已回滚新副本。")
+
+        source_tail_index = next((index for index, record in enumerate(source_records)
+                                  if record["record"] == "TAIL"), len(source_records))
+        appended = readback["records"][source_tail_index]
+        vent_records = [record for record in readback["records"] if record["record"] == "VENT"]
+        if not vent_records or vent_records[-1] != appended:
+            raise ToolError("回读发现新增 &VENT 不是最后一条 VENT 记录；已回滚新副本。")
+        if set(appended["fields"]) != {"XB", "SURF_ID"}:
+            raise ToolError(f"新增 &VENT 的字段集合不是 XB 和 SURF_ID：{sorted(appended['fields'])}；已回滚新副本。")
+        if appended["fields"].get("XB") != coords:
+            raise ToolError(
+                f"新增 &VENT 的 XB 回读不一致：{appended['fields'].get('XB')}，应为 {coords}；已回滚新副本。")
+        if appended["fields"].get("SURF_ID") != surface_id:
+            raise ToolError("新增 &VENT 的 SURF_ID 回读不一致；已回滚新副本。")
+
+        for index, before in enumerate(source_records):
+            readback_index = index if index < source_tail_index else index + 1
+            after = readback["records"][readback_index]
+            if before["record"] == "HEAD":
+                before_fields = dict(before["fields"])
+                after_fields = dict(after["fields"])
+                before_fields.pop("CHID", None)
+                after_fields.pop("CHID", None)
+                if before_fields != after_fields:
+                    raise ToolError("回读发现 &HEAD 的非 CHID 字段被意外改变；已回滚新副本。")
+                continue
+            if before["fields"] != after["fields"]:
+                raise ToolError(f"回读发现 &{before['record']} 记录字段被意外改变；已回滚新副本。")
+            if source_match_objects[index].group(0) != new_matches[readback_index].group(0):
+                raise ToolError(f"回读发现 &{before['record']} 记录文本被意外改变；已回滚新副本。")
+
+        if hashlib.sha256(source_path.read_bytes()).hexdigest() != source_sha256:
+            raise ToolError("源算例在操作期间发生变化；已回滚新副本。")
+        return {
+            "case_id": new_case_id,
+            "source_id": source_id,
+            "file": created["file"],
+            "source_sha256": source_sha256,
+            "source_unchanged": True,
+            "vent": {"record": "VENT", "fields": appended["fields"],
+                     "record_text": record_text, "mesh_indices": containing_meshes},
+            "readback": {"XB": appended["fields"]["XB"],
+                         "SURF_ID": appended["fields"]["SURF_ID"],
+                         "last_vent": True},
+            "record_count_before": len(source_records),
+            "record_count_after": len(readback["records"]),
+            "sha256": readback["sha256"],
+            "verified": True,
+            "note": ("只追加了一条仅含 XB 和 SURF_ID 的 &VENT，引用源算例中唯一匹配的现有 &SURF；"
+                     "已验证源文件未变、平面恰好一个轴厚度为零、其他两轴宽度为正、位于指定网格域内，"
+                     "并回读确认新增记录是最后一条 VENT 且其他记录未被改动（仅允许复制的 HEAD.CHID 变化）。"
+                     "未检查与现有几何重叠、面朝向或物理适用性；未启动求解或 PyroSim，"
+                     "请继续人工审查并执行 preflight。"),
+        }
+    except Exception:
+        # `created` is only set after create_case returns, so this removes just
+        # the copy that this call made and leaves the source and other files alone.
+        if created is not None:
+            Path(created["file"]).unlink(missing_ok=True)
+        raise
+
+
 def create_case_with_obstruction_updates(config: dict, source_id: str, new_case_id: str,
                                          obstruction_id: str, xb: list[float]) -> dict:
     """Clone a case and replace only XB on one existing &OBST matched by ID.
