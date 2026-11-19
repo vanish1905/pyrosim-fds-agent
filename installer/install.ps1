@@ -41,7 +41,7 @@ try {
     $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\PyroSimFdsAgent'
     New-Item -Path $uninstallKey -Force | Out-Null
     Set-ItemProperty -Path $uninstallKey -Name DisplayName -Value 'PyroSim / FDS Agent'
-    Set-ItemProperty -Path $uninstallKey -Name DisplayVersion -Value '1.0.5'
+    Set-ItemProperty -Path $uninstallKey -Name DisplayVersion -Value '1.0.6'
     Set-ItemProperty -Path $uninstallKey -Name Publisher -Value 'PyroSim / FDS Agent'
     Set-ItemProperty -Path $uninstallKey -Name InstallLocation -Value $appDir
     Set-ItemProperty -Path $uninstallKey -Name DisplayIcon -Value (Join-Path $appDir 'assets\pyrosim_agent.ico')

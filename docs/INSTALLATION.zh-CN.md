@@ -4,7 +4,7 @@
 
 | 组件 | 获取方式 | 说明 |
 | --- | --- | --- |
-| PyroSim / FDS Agent 1.0.5 | 本项目公开 GitHub Release | Qt 工作台、MCP 服务、TEMPERATURE 示例和桌面/开始菜单快捷方式。 |
+| PyroSim / FDS Agent 1.0.6 | 本项目公开 GitHub Release | Qt 工作台、MCP 服务、TEMPERATURE 示例和桌面/开始菜单快捷方式。 |
 | FDS + Smokeview | 同一 Release | `FDS-6.11.1_SMV-6.11.2_win.exe`。此版本尚未完成项目适配器的版本验证，首次使用应先跑小算例。 |
 | Qwen3-0.6B 离线模型包 | 同一 Release，可选 | 独立安装器，包含 GGUF 权重、llama.cpp CPU/Vulkan 运行时及许可证；不要求另装 LM Studio/Ollama。 |
 | Qwen3-0.6B 原始 GGUF | 同一 Release，可选 | 仅权重文件，适合已有 LM Studio、Ollama 或其他推理服务的用户。 |
