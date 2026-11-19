@@ -1610,11 +1610,20 @@ def list_geometry_assets(config: dict) -> dict:
             "note": "只列工作区根目录中最多 200 个 OBJ/STL；不读取网格几何、不递归子目录。"}
 
 
-def inspect_geometry_asset(config: dict, mesh_file: str) -> dict:
+def inspect_geometry_asset(config: dict, mesh_file: str, case_id: str | None = None,
+                           scale: float = 1.0, translation: list[float] | None = None) -> dict:
     """Inspect a workspace mesh and report its material groups and geometric bounds."""
     import math
 
     root = case_root(config).resolve()
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or not 0 < scale <= 10000:
+        raise ToolError("scale 必须是 (0, 10000] 范围内的有限数值。")
+    if translation is None:
+        translation = [0.0, 0.0, 0.0]
+    if (not isinstance(translation, list) or len(translation) != 3
+            or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                   or not math.isfinite(value) for value in translation)):
+        raise ToolError("translation 必须是 3 个有限数值组成的数组，单位 m。")
     if (not isinstance(mesh_file, str) or Path(mesh_file).is_absolute()
             or Path(mesh_file).name != mesh_file or mesh_file in {".", ".."}):
         raise ToolError("mesh_file 必须是算例工作区根目录中的 OBJ/STL 文件名。")
@@ -1628,6 +1637,30 @@ def inspect_geometry_asset(config: dict, mesh_file: str) -> dict:
     spans = [upper - lower for lower, upper in bounds]
     if not all(math.isfinite(value) for value in spans):
         raise ToolError("网格包围盒无效。")
+    transformed_bounds = [[bounds[axis][endpoint] * float(scale) + float(translation[axis])
+                           for endpoint in (0, 1)] for axis in range(3)]
+    if not all(math.isfinite(value) for axis_bounds in transformed_bounds for value in axis_bounds):
+        raise ToolError("缩放或平移后网格包围盒溢出；请缩小 scale 或调整坐标。")
+    mesh_fit = None
+    if case_id is not None:
+        case = inspect_case(config, case_id)
+        mesh_records = [record for record in case["records"] if record["record"] == "MESH"]
+        valid_domains = []
+        for index, record in enumerate(mesh_records, 1):
+            xb = record["fields"].get("XB")
+            if (isinstance(xb, list) and len(xb) == 6
+                    and all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                            and math.isfinite(value) for value in xb)
+                    and all(xb[axis] < xb[axis + 1] for axis in (0, 2, 4))):
+                valid_domains.append((index, xb))
+        containing = [index for index, xb in valid_domains
+                      if all(xb[2 * axis] <= transformed_bounds[axis][0]
+                             and transformed_bounds[axis][1] <= xb[2 * axis + 1]
+                             for axis in range(3))]
+        mesh_fit = {"case_id": case_id, "valid_meshes": len(valid_domains),
+                    "fits_single_mesh": bool(containing), "containing_mesh_indices": containing,
+                    "transformed_bounds_xyz": transformed_bounds,
+                    "note": "包围盒完全包含于单个 MESH.XB 才判定通过；这是保守的几何范围检查，不检查面网格、重叠或分辨率。"}
     material_counts = {}
     for material in face_materials:
         if material is not None:
@@ -1636,7 +1669,8 @@ def inspect_geometry_asset(config: dict, mesh_file: str) -> dict:
             "bytes": asset_path.stat().st_size,
             "sha256": hashlib.sha256(asset_path.read_bytes()).hexdigest(),
             "vertices": len(vertices), "triangles": len(faces), "closed_manifold": True,
-            "bounds_xyz": bounds, "material_groups": [
+            "bounds_xyz": bounds, "scale": float(scale), "translation": translation,
+            "mesh_fit": mesh_fit, "material_groups": [
                 {"name": name, "triangles": count} for name, count in sorted(material_counts.items())],
             "unassigned_triangles": sum(1 for material in face_materials if material is None),
             "note": "闭合性仅指边流形和面绕序检查通过；不会读取/套用 MTL 参数、IFC 属性，也不检查自交、碰撞或网格分辨率。"}
