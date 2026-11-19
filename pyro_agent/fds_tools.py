@@ -977,8 +977,11 @@ def add_vent_to_case(config: dict, source_id: str, new_case_id: str, xb: list[fl
                                   if record["record"] == "TAIL"), len(source_records))
         appended = readback["records"][source_tail_index]
         vent_records = [record for record in readback["records"] if record["record"] == "VENT"]
-        if not vent_records or vent_records[-1] != appended:
+        if appended["record"] != "VENT" or not vent_records or vent_records[-1] != appended:
             raise ToolError("回读发现新增 &VENT 不是最后一条 VENT 记录；已回滚新副本。")
+        source_vent_count = sum(1 for record in source_records if record["record"] == "VENT")
+        if len(vent_records) != source_vent_count + 1:
+            raise ToolError("回读发现 &VENT 记录数量不是源算例加一；已回滚新副本。")
         if set(appended["fields"]) != {"XB", "SURF_ID"}:
             raise ToolError(f"新增 &VENT 的字段集合不是 XB 和 SURF_ID：{sorted(appended['fields'])}；已回滚新副本。")
         if appended["fields"].get("XB") != coords:
@@ -997,6 +1000,10 @@ def add_vent_to_case(config: dict, source_id: str, new_case_id: str, xb: list[fl
                 after_fields.pop("CHID", None)
                 if before_fields != after_fields:
                     raise ToolError("回读发现 &HEAD 的非 CHID 字段被意外改变；已回滚新副本。")
+                chid_pattern = re.compile(r"(?i)(\bCHID\s*=\s*)(?:'[^']*'|\"[^\"]*\")")
+                if (chid_pattern.sub(r"\1'<CHID>'", source_match_objects[index].group(0))
+                        != chid_pattern.sub(r"\1'<CHID>'", new_matches[readback_index].group(0))):
+                    raise ToolError("回读发现 &HEAD 的 CHID 以外文本被意外改变；已回滚新副本。")
                 continue
             if before["fields"] != after["fields"]:
                 raise ToolError(f"回读发现 &{before['record']} 记录字段被意外改变；已回滚新副本。")
