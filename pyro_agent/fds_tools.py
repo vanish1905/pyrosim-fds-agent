@@ -267,10 +267,16 @@ def compare_boundary_records(config: dict, case_a: str, case_b: str,
         fields = item["fields"]
         if item["record_type"] != "GEOM":
             return fields
+        vertices = fields.get("VERTS", [])
+        faces = fields.get("FACES", [])
         summary = {key: value for key, value in fields.items() if key not in {"VERTS", "FACES"}}
         summary["_mesh_summary"] = {
-            "vertices": len(fields.get("VERTS", [])) // 3,
-            "triangles": len(fields.get("FACES", [])) // 4,
+            "vertices": len(vertices) // 3,
+            "triangles": len(faces) // 4,
+            "vertices_sha256": hashlib.sha256(json.dumps(
+                vertices, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest(),
+            "faces_sha256": hashlib.sha256(json.dumps(
+                faces, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest(),
         }
         return summary
 
@@ -301,7 +307,7 @@ def compare_boundary_records(config: dict, case_a: str, case_b: str,
             "case_b": case_b, "sha256_b": right["sha256"],
             "record_type_filter": record_type, "equal": not changes,
             "change_count": len(changes), "changes": changes,
-            "note": "只比较 SURF/VENT/GEOM namelist。GEOM 的顶点和面数组以计数摘要呈现；相同 ID 优先匹配，否则使用各类型序号。此对比不验证 FDS 物理有效性。"}
+            "note": "只比较 SURF/VENT/GEOM namelist。GEOM 的顶点和面数组以数量与 SHA-256 摘要呈现，不返回大数组；相同 ID 优先匹配，否则使用各类型序号。此对比不验证 FDS 物理有效性。"}
 
 
 def compare_case_inputs(config: dict, case_a: str, case_b: str,
