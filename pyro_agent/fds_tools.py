@@ -397,15 +397,29 @@ def _parse_namelist_fields(body: str) -> dict:
 
 def _parse_namelist_value(raw: str):
     raw = raw.strip()
-    if raw.startswith(("'", '"')):
-        quote = raw[0]
-        end = raw.rfind(quote)
-        if end > 0:
-            return raw[1:end].replace(quote + quote, quote)
     if raw.startswith("(") and raw.endswith(")"):
         raw = raw[1:-1].strip()
-    if "," in raw:
-        return [_parse_namelist_scalar(item.strip()) for item in raw.split(",") if item.strip()]
+    items = []
+    quote = None
+    start = 0
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if quote:
+            if char == quote:
+                if index + 1 < len(raw) and raw[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == ",":
+            items.append(raw[start:index].strip())
+            start = index + 1
+        index += 1
+    if items:
+        items.append(raw[start:].strip())
+        return [_parse_namelist_scalar(item) for item in items if item]
     return _parse_namelist_scalar(raw)
 
 
@@ -916,7 +930,8 @@ def add_obstruction_to_case(config: dict, source_id: str, new_case_id: str, xb: 
         raise
 
 
-def _parse_surface_mesh(path: Path) -> tuple[list[tuple[float, float, float]], list[tuple[int, int, int]]]:
+def _parse_surface_mesh(path: Path) -> tuple[
+        list[tuple[float, float, float]], list[tuple[int, int, int]], list[str | None]]:
     """Read a bounded OBJ or STL triangle mesh without loading third-party code."""
     import math
     import struct
@@ -925,6 +940,7 @@ def _parse_surface_mesh(path: Path) -> tuple[list[tuple[float, float, float]], l
         raise ToolError("CAD 网格文件超过 50 MiB 限制。")
     vertices: list[tuple[float, float, float]] = []
     faces: list[tuple[int, int, int]] = []
+    face_materials: list[str | None] = []
 
     def vertex_index(point):
         point = tuple(float(v) for v in point)
@@ -933,15 +949,17 @@ def _parse_surface_mesh(path: Path) -> tuple[list[tuple[float, float, float]], l
         vertices.append(point)
         return len(vertices)
 
-    def add_polygon(indices):
+    def add_polygon(indices, material=None):
         if len(indices) != 3:
             raise ToolError("OBJ 必须已三角化；请在 CAD/BIM 工具中先三角化再导出，以避免改变多边形边界。")
         faces.append(tuple(indices))
+        face_materials.append(material)
         if len(faces) > 20000:
             raise ToolError("CAD 网格三角面超过 20,000 个限制；请在 CAD 工具中先简化网格。")
 
     if path.suffix.lower() == ".obj":
         source_vertices = []
+        current_material = None
         try:
             for line_number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
                 parts = line.partition("#")[0].split()
@@ -956,6 +974,11 @@ def _parse_surface_mesh(path: Path) -> tuple[list[tuple[float, float, float]], l
                     source_vertices.append(point)
                     if len(source_vertices) > 10000:
                         raise ToolError("CAD 网格顶点超过 10,000 个限制；请先简化网格。")
+                elif parts[0] == "usemtl":
+                    current_material = " ".join(parts[1:]) if len(parts) > 1 else None
+                    if current_material is not None and (len(current_material) > 128
+                                                         or any(ord(char) < 32 for char in current_material)):
+                        raise ToolError(f"OBJ 第 {line_number} 行的 usemtl 名称无效或过长。")
                 elif parts[0] == "f":
                     indexes = []
                     for item in parts[1:]:
@@ -967,7 +990,7 @@ def _parse_surface_mesh(path: Path) -> tuple[list[tuple[float, float, float]], l
                         if index < 0 or index >= len(source_vertices):
                             raise ToolError(f"OBJ 第 {line_number} 行的面引用了不存在的顶点。")
                         indexes.append(index + 1)
-                    add_polygon(indexes)
+                    add_polygon(indexes, current_material)
         except (UnicodeError, ValueError, OverflowError) as exc:
             raise ToolError(f"无法解析 OBJ 网格：{exc}") from None
         used = sorted({index for face in faces for index in face})
@@ -1014,6 +1037,7 @@ def _parse_surface_mesh(path: Path) -> tuple[list[tuple[float, float, float]], l
                     vertices.append(key)
                 face.append(deduplicated[key])
             faces.append(tuple(face))
+            face_materials.append(None)
         if len(vertices) > 10000:
             raise ToolError("CAD 网格顶点超过 10,000 个限制；请先简化网格。")
 
@@ -1048,7 +1072,7 @@ def _parse_surface_mesh(path: Path) -> tuple[list[tuple[float, float, float]], l
         raise ToolError("CAD 网格包围体积无效或为零。")
     if signed_volume < 0:
         faces = [(a, c, b) for a, b, c in faces]
-    return vertices, faces
+    return vertices, faces, face_materials
 
 
 def _typed_fds_value(value, original, field: str) -> tuple[str, object]:
@@ -1331,7 +1355,8 @@ def edit_boundary_fields(config: dict, source_id: str, new_case_id: str,
 
 def add_geometry_mesh_to_case(config: dict, source_id: str, new_case_id: str,
                               mesh_file: str, geometry_id: str, surface_id: str,
-                              scale: float = 1.0, translation: list[float] | None = None) -> dict:
+                              scale: float = 1.0, translation: list[float] | None = None,
+                              material_surface_map: dict[str, str] | None = None) -> dict:
     """Import one closed OBJ/STL solid into FDS GEOM on a new case copy."""
     import math
 
@@ -1355,7 +1380,31 @@ def add_geometry_mesh_to_case(config: dict, source_id: str, new_case_id: str,
         raise ToolError("translation 必须是 3 个有限数值组成的数组，单位 m。")
 
     mesh_sha = hashlib.sha256(asset_path.read_bytes()).hexdigest()
-    vertices, faces = _parse_surface_mesh(asset_path)
+    vertices, faces, face_materials = _parse_surface_mesh(asset_path)
+    if material_surface_map is not None:
+        if (not isinstance(material_surface_map, dict) or not material_surface_map
+                or len(material_surface_map) > 32):
+            raise ToolError("material_surface_map 必须是 1–32 项的 OBJ usemtl 名称到 FDS SURF.ID 映射。")
+        for material, mapped_surface in material_surface_map.items():
+            if (not isinstance(material, str) or not material or len(material) > 128
+                    or any(ord(char) < 32 for char in material)):
+                raise ToolError("material_surface_map 中的 OBJ 材质名无效。")
+            if not isinstance(mapped_surface, str) or not re.fullmatch(
+                    r"[A-Za-z][A-Za-z0-9_-]{0,31}", mapped_surface):
+                raise ToolError("材质映射的 SURF.ID 必须以字母开头，且仅含字母、数字、_ 或 -（最多 32 字符）。")
+        used_materials = {material for material in face_materials if material is not None}
+        unmapped = sorted(used_materials - set(material_surface_map))
+        unused = sorted(set(material_surface_map) - used_materials)
+        if unmapped:
+            raise ToolError(f"OBJ 中这些 usemtl 名称没有映射到 FDS SURF.ID：{', '.join(unmapped)}。")
+        if unused:
+            raise ToolError(f"映射包含 OBJ 中未使用的材质名：{', '.join(unused)}。")
+    elif any(material is not None for material in face_materials):
+        # Backward-compatible single-surface mode deliberately applies the
+        # provided surface_id to every face, even when the OBJ has usemtl tags.
+        material_surface_map = {}
+    else:
+        material_surface_map = {}
     transformed = [tuple(float(f"{float(value) * float(scale) + float(translation[axis]):.12g}")
                          for axis, value in enumerate(vertex)) for vertex in vertices]
     source_path = _case_file(config, source_id)
@@ -1363,9 +1412,17 @@ def add_geometry_mesh_to_case(config: dict, source_id: str, new_case_id: str,
     source_text = source_path.read_text(encoding="utf-8-sig")
     source_matches = list(RECORD_RE.finditer(source_text))
     source_records = [{"record": m.group(1).upper(), "fields": _parse_namelist_fields(m.group(2))} for m in source_matches]
-    surfaces = [r for r in source_records if r["record"] == "SURF" and r["fields"].get("ID") == surface_id]
-    if len(surfaces) != 1:
-        raise ToolError(f"surface_id 必须唯一匹配现有 &SURF.ID；匹配数量：{len(surfaces)}。")
+    surface_ids = [surface_id]
+    for material in face_materials:
+        if material is not None and material in material_surface_map:
+            mapped_id = material_surface_map[material]
+            if mapped_id not in surface_ids:
+                surface_ids.append(mapped_id)
+    for selected_surface_id in surface_ids:
+        surfaces = [r for r in source_records if r["record"] == "SURF"
+                    and r["fields"].get("ID") == selected_surface_id]
+        if len(surfaces) != 1:
+            raise ToolError(f"surface_id {selected_surface_id!r} 必须唯一匹配现有 &SURF.ID；匹配数量：{len(surfaces)}。")
     if any(r["record"] == "GEOM" and r["fields"].get("ID") == geometry_id for r in source_records):
         raise ToolError(f"源算例已存在 geometry_id={geometry_id!r}。")
     meshes = [r["fields"].get("XB") for r in source_records if r["record"] == "MESH"]
@@ -1387,8 +1444,13 @@ def add_geometry_mesh_to_case(config: dict, source_id: str, new_case_id: str,
             raise ToolError("导入网格的每个三角面都必须完整位于同一个源 MESH.XB 内。")
 
     vert_rows = [", ".join(f"{value:.12g}" for value in vertex) for vertex in transformed]
-    face_rows = [", ".join(str(value) for value in (*face, 1)) for face in faces]
-    geom_text = (f"&GEOM ID='{geometry_id}', SURF_ID='{surface_id}', VERTS=\n"
+    face_surface_indexes = [surface_ids.index(material_surface_map[material]) + 1
+                            if material is not None and material in material_surface_map else 1
+                            for material in face_materials]
+    face_rows = [", ".join(str(value) for value in (*face, surface_index))
+                 for face, surface_index in zip(faces, face_surface_indexes)]
+    surface_text = ",".join(f"'{value}'" for value in surface_ids)
+    geom_text = (f"&GEOM ID='{geometry_id}', SURF_ID={surface_text}, VERTS=\n"
                  + ",\n".join(vert_rows) + ",\nFACES=\n"
                  + ",\n".join(face_rows) + " /\n")
     created = None
@@ -1406,9 +1468,12 @@ def add_geometry_mesh_to_case(config: dict, source_id: str, new_case_id: str,
         geom_index = source_tail_index
         geoms = [r for r in readback["records"] if r["record"] == "GEOM" and r["fields"].get("ID") == geometry_id]
         source_geom_count = sum(1 for r in source_records if r["record"] == "GEOM")
-        if (len(geoms) != 1 or geoms[0]["fields"].get("SURF_ID") != surface_id
+        expected_surface_value = surface_ids if len(surface_ids) > 1 else surface_id
+        if (len(geoms) != 1 or geoms[0]["fields"].get("SURF_ID") != expected_surface_value
                 or geoms[0]["fields"].get("VERTS") != [v for vertex in transformed for v in vertex]
-                or geoms[0]["fields"].get("FACES") != [v for face in faces for v in (*face, 1)]
+                or geoms[0]["fields"].get("FACES") != [v for face, surface_index
+                                                          in zip(faces, face_surface_indexes)
+                                                          for v in (*face, surface_index)]
                 or sum(1 for r in readback["records"] if r["record"] == "GEOM") != source_geom_count + 1
                 or len(readback["records"]) != len(source_records) + 1
                 or len(new_matches) != len(source_matches) + 1
@@ -1436,7 +1501,9 @@ def add_geometry_mesh_to_case(config: dict, source_id: str, new_case_id: str,
         return {"case_id": new_case_id, "source_id": source_id, "file": created["file"],
                 "source_sha256": source_sha, "source_unchanged": True,
                 "mesh_file": str(asset_path), "mesh_sha256": mesh_sha,
-                "format": asset_path.suffix.lower(), "geometry_id": geometry_id, "surface_id": surface_id,
+                "format": asset_path.suffix.lower(), "geometry_id": geometry_id,
+                "surface_ids": surface_ids,
+                "material_surface_map": material_surface_map,
                 "vertices": len(transformed), "triangles": len(faces), "scale": float(scale),
                 "translation": translation, "readback_verified": True,
                 "note": "已把闭合三角网格写为 FDS &GEOM VERTS/FACES 并在副本中回读。未检查自交、碰撞、材料适用性或网格质量；OBJ 材质组/IFC 构件属性不保留。需执行 FDS preflight 并由工程师检查。"}
@@ -1461,6 +1528,38 @@ def list_geometry_assets(config: dict) -> dict:
             break
     return {"case_root": str(root), "assets": assets,
             "note": "只列工作区根目录中最多 200 个 OBJ/STL；不读取网格几何、不递归子目录。"}
+
+
+def inspect_geometry_asset(config: dict, mesh_file: str) -> dict:
+    """Inspect a workspace mesh and report its material groups and geometric bounds."""
+    import math
+
+    root = case_root(config).resolve()
+    if (not isinstance(mesh_file, str) or Path(mesh_file).is_absolute()
+            or Path(mesh_file).name != mesh_file or mesh_file in {".", ".."}):
+        raise ToolError("mesh_file 必须是算例工作区根目录中的 OBJ/STL 文件名。")
+    asset_path = (root / mesh_file).resolve()
+    if (asset_path.parent != root or not asset_path.is_file()
+            or asset_path.suffix.lower() not in {".obj", ".stl"}):
+        raise ToolError("仅支持算例工作区根目录中的 .obj 或 .stl 文件，禁止路径越界。")
+    vertices, faces, face_materials = _parse_surface_mesh(asset_path)
+    bounds = [[min(vertex[axis] for vertex in vertices), max(vertex[axis] for vertex in vertices)]
+              for axis in range(3)]
+    spans = [upper - lower for lower, upper in bounds]
+    if not all(math.isfinite(value) for value in spans):
+        raise ToolError("网格包围盒无效。")
+    material_counts = {}
+    for material in face_materials:
+        if material is not None:
+            material_counts[material] = material_counts.get(material, 0) + 1
+    return {"mesh_file": asset_path.name, "format": asset_path.suffix.lower(),
+            "bytes": asset_path.stat().st_size,
+            "sha256": hashlib.sha256(asset_path.read_bytes()).hexdigest(),
+            "vertices": len(vertices), "triangles": len(faces), "closed_manifold": True,
+            "bounds_xyz": bounds, "material_groups": [
+                {"name": name, "triangles": count} for name, count in sorted(material_counts.items())],
+            "unassigned_triangles": sum(1 for material in face_materials if material is None),
+            "note": "闭合性仅指边流形和面绕序检查通过；不会读取/套用 MTL 参数、IFC 属性，也不检查自交、碰撞或网格分辨率。"}
 
 
 def add_vent_to_case(config: dict, source_id: str, new_case_id: str, xb: list[float],
