@@ -66,8 +66,19 @@ class BoundaryPreviewTests(unittest.TestCase):
     def test_mcp_exposes_preview_then_token_only_apply(self):
         tools = {item["name"]: item["inputSchema"] for item in TOOLS}
         self.assertIn("preview_boundary_field_edits", tools)
+        self.assertNotIn("oneOf", tools["preview_boundary_field_edits"])
         self.assertEqual(tools["edit_boundary_fields"]["required"], ["preview_id"])
         self.assertNotIn("updates", tools["edit_boundary_fields"]["properties"])
+
+    def test_preview_requires_exactly_one_target_selector(self):
+        for selectors in ({}, {"target_index": 1, "target_id": "WALL"}):
+            with self.subTest(selectors=selectors), self.assertRaises(fds_tools.ToolError):
+                fds_tools.preview_boundary_field_edits(
+                    self.config, "preview_source", "bad_selector_copy", "SURF",
+                    {"TMP_FRONT": 25.0}, **selectors,
+                )
+        preview_dir = self.root / ".pyro_agent_previews" / "boundary_fields"
+        self.assertFalse(preview_dir.exists())
 
     def test_apply_rejects_source_changed_after_preview(self):
         preview = fds_tools.preview_boundary_field_edits(
