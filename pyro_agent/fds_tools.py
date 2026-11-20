@@ -1310,6 +1310,8 @@ def edit_boundary_fields(config: dict, source_id: str, new_case_id: str,
         field_base = field.split("(", 1)[0]
         if field_base in {"ID", "VERTS", "FACES"} or ("(" in field and field_base in {"XB", "SURF_ID"}):
             raise ToolError(f"不支持修改保护字段 {field!r}。")
+        if field in normalized_fields:
+            raise ToolError(f"字段 {field} 在请求中重复出现（大小写不敏感）。")
         normalized_fields[field] = value
 
     source = _case_file(config, source_id)
@@ -1486,6 +1488,8 @@ def preview_boundary_field_edits(config: dict, source_id: str, new_case_id: str,
         base = normalized.split("(", 1)[0]
         if base in {"ID", "VERTS", "FACES"} or ("(" in normalized and base in {"XB", "SURF_ID"}):
             raise ToolError(f"不支持修改保护字段 {field!r}。")
+        if normalized in normalized_updates:
+            raise ToolError(f"字段 {normalized} 在预览请求中重复出现（大小写不敏感）。")
         exists = normalized in target["fields"]
         if not exists and re.search(rf"\b{re.escape(base)}\s*\(", original_body, re.I):
             raise ToolError(f"字段 {base} 已有索引式定义；预览不会替换整个数组。")
@@ -1493,6 +1497,28 @@ def preview_boundary_field_edits(config: dict, source_id: str, new_case_id: str,
             raise ToolError("XB 只能修改现有 VENT.XB；其他几何使用专用工具。")
         if base == "SURF_ID" and (record_type != "VENT" or "(" in normalized):
             raise ToolError("SURF_ID 只能在 VENT 上设置。")
+        if base == "XB" and record_type == "VENT":
+            import math
+            meshes = [item["fields"].get("XB") for item in parsed["records"] if item["record"] == "MESH"]
+            if (not isinstance(value, list) or len(value) != 6
+                    or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                           for v in value)
+                    or any(value[i] > value[i + 1] for i in (0, 2, 4))
+                    or sum(value[i] == value[i + 1] for i in (0, 2, 4)) != 1):
+                raise ToolError("VENT.XB 必须是 6 个有限数值，恰好一个轴厚度为零，另外两轴宽度大于零。")
+            valid_meshes = [mesh for mesh in meshes if isinstance(mesh, list) and len(mesh) == 6
+                            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                                    and math.isfinite(v) for v in mesh)
+                            and all(mesh[i] < mesh[i + 1] for i in (0, 2, 4))]
+            if not any(all(mesh[axis] <= value[axis] <= value[axis + 1] <= mesh[axis + 1]
+                           for axis in (0, 2, 4)) for mesh in valid_meshes):
+                raise ToolError("VENT.XB 必须完整位于至少一个源 MESH.XB 内。")
+        if base == "SURF_ID" and record_type == "VENT":
+            existing_surface_ids = [item["fields"].get("ID") for item in parsed["records"]
+                                     if item["record"] == "SURF"]
+            if (not isinstance(value, str) or (value.upper() != "OPEN"
+                    and sum(1 for item in existing_surface_ids if item == value) != 1)):
+                raise ToolError("VENT.SURF_ID 必须是 OPEN 或精确引用源算例中唯一一条 SURF.ID。")
         if base == "XB" and record_type == "VENT":
             import math
             if (not isinstance(value, list) or len(value) != 6 or any(
@@ -1572,6 +1598,9 @@ def apply_boundary_field_preview(config: dict, preview_id: str) -> dict:
     result = edit_boundary_fields(config, manifest["source_id"], manifest["new_case_id"],
                                   manifest["record_type"], manifest["target_index"],
                                   manifest["updates"], manifest.get("target_id"))
+    if result.get("source_sha256") != manifest.get("source_sha256"):
+        Path(result["file"]).unlink(missing_ok=True)
+        raise ToolError("实际写入时源文件已不同于预览版本；已删除本次隔离副本，请重新生成并展示预览。")
     manifest_path.unlink(missing_ok=True)
     return {**result, "preview_id": preview_id,
             "preview_source_sha256": manifest["source_sha256"],
