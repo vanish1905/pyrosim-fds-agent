@@ -1280,6 +1280,42 @@ def _replace_existing_namelist_field(body: str, field: str, replacement: str) ->
     return body[:value_start] + replacement + body[last_data:]
 
 
+def _validate_boundary_field_shape(record_type: str, field: str, value, field_exists: bool,
+                                   original_body: str, records: list[dict]) -> None:
+    """Shared structural checks used by both preview and copy application."""
+    import math
+
+    base = field.split("(", 1)[0]
+    if not field_exists and re.search(rf"\b{re.escape(base)}\s*\(", original_body, re.I):
+        raise ToolError(f"字段 {base} 已有索引式定义；不能将其当作全新简单字段添加。")
+    if base == "XB":
+        if record_type != "VENT" or not field_exists or "(" in field:
+            raise ToolError("XB 只能修改现有 VENT.XB；其他几何使用专用工具。")
+        if (not isinstance(value, list) or len(value) != 6
+                or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                       for v in value)
+                or any(value[i] > value[i + 1] for i in (0, 2, 4))
+                or sum(value[i] == value[i + 1] for i in (0, 2, 4)) != 1):
+            raise ToolError("VENT.XB 必须是 6 个有限数值，恰好一个轴厚度为零，另外两轴宽度大于零。")
+        mesh_boxes = [item["fields"].get("XB") for item in records if item["record"] == "MESH"]
+        valid_meshes = [box for box in mesh_boxes if isinstance(box, list) and len(box) == 6
+                        and all(isinstance(bound, (int, float)) and not isinstance(bound, bool)
+                                and math.isfinite(bound) for bound in box)
+                        and all(box[i] < box[i + 1] for i in (0, 2, 4))]
+        if not any(all(box[axis] <= value[axis] and value[axis + 1] <= box[axis + 1]
+                       for axis in (0, 2, 4)) for box in valid_meshes):
+            raise ToolError("VENT.XB 必须完整位于至少一个有效源 MESH.XB 内。")
+    if base == "SURF_ID":
+        if record_type != "VENT" or "(" in field:
+            raise ToolError("SURF_ID 只能在 VENT 上设置。")
+        if not isinstance(value, str):
+            raise ToolError("VENT.SURF_ID 必须是现有 SURF.ID 或 OPEN 文本。")
+        if value.upper() != "OPEN" and sum(
+                1 for item in records if item["record"] == "SURF"
+                and item["fields"].get("ID") == value) != 1:
+            raise ToolError("VENT.SURF_ID 必须精确引用源算例中唯一一条现有 &SURF.ID。")
+
+
 def edit_boundary_fields(config: dict, source_id: str, new_case_id: str,
                          record_type: str, target_index: int | None, updates: dict,
                          target_id: str | None = None) -> dict:
@@ -1337,30 +1373,8 @@ def edit_boundary_fields(config: dict, source_id: str, new_case_id: str,
     prepared = {}
     for field, value in normalized_fields.items():
         field_exists = field in target_before["fields"]
-        if (not field_exists and re.search(rf"\b{re.escape(field)}\s*\(", target_original_body, re.I)):
-            raise ToolError(f"字段 {field} 在目标记录中以索引数组形式出现；此工具不修改索引式字段。")
-        field_base = field.split("(", 1)[0]
-        if field_base == "XB" and record_type != "VENT":
-            raise ToolError("此工具只允许编辑 VENT.XB；实体 OBST.XB 使用专用几何工具。")
-        if field_base == "SURF_ID" and record_type != "VENT":
-            raise ToolError("SURF_ID 只能在 VENT 上设置；SURF 记录不能通过此字段建立引用。")
-        if field_base == "XB" and not field_exists:
-            raise ToolError("目标 VENT 当前没有 XB；请使用专用通风口工具创建几何，不在此处混加字段。")
-        if field_base == "XB" and record_type == "VENT":
-            if not isinstance(value, list) or len(value) != 6 or any(
-                    isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in value):
-                raise ToolError("VENT.XB 必须是 6 个有限数值。")
-            if any(value[i] >= value[i + 1] for i in (0, 2, 4)) or sum(
-                    value[i] == value[i + 1] for i in (0, 2, 4)) != 1:
-                raise ToolError("VENT.XB 必须恰好有一个轴厚度为零，另外两轴宽度必须大于零。")
-            meshes = [r["fields"].get("XB") for r in original_records if r["record"] == "MESH"]
-            valid_meshes = [mesh for mesh in meshes if isinstance(mesh, list) and len(mesh) == 6
-                            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                                    and math.isfinite(v) for v in mesh)
-                            and all(mesh[axis] < mesh[axis + 1] for axis in (0, 2, 4))]
-            if not any(all(mesh[axis] <= value[axis] and value[axis + 1] <= mesh[axis + 1]
-                           for axis in (0, 2, 4)) for mesh in valid_meshes):
-                raise ToolError("VENT.XB 必须完整位于至少一个源 MESH.XB 内。")
+        _validate_boundary_field_shape(record_type, field, value, field_exists,
+                                       target_original_body, original_records)
         prepared[field] = (_typed_fds_value(value, target_before["fields"][field], field)
                            if field_exists else _new_fds_value(value, field))
 
@@ -1491,58 +1505,8 @@ def preview_boundary_field_edits(config: dict, source_id: str, new_case_id: str,
         if normalized in normalized_updates:
             raise ToolError(f"字段 {normalized} 在预览请求中重复出现（大小写不敏感）。")
         exists = normalized in target["fields"]
-        if not exists and re.search(rf"\b{re.escape(base)}\s*\(", original_body, re.I):
-            raise ToolError(f"字段 {base} 已有索引式定义；预览不会替换整个数组。")
-        if base == "XB" and (record_type != "VENT" or not exists or "(" in normalized):
-            raise ToolError("XB 只能修改现有 VENT.XB；其他几何使用专用工具。")
-        if base == "SURF_ID" and (record_type != "VENT" or "(" in normalized):
-            raise ToolError("SURF_ID 只能在 VENT 上设置。")
-        if base == "XB" and record_type == "VENT":
-            import math
-            meshes = [item["fields"].get("XB") for item in parsed["records"] if item["record"] == "MESH"]
-            if (not isinstance(value, list) or len(value) != 6
-                    or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
-                           for v in value)
-                    or any(value[i] > value[i + 1] for i in (0, 2, 4))
-                    or sum(value[i] == value[i + 1] for i in (0, 2, 4)) != 1):
-                raise ToolError("VENT.XB 必须是 6 个有限数值，恰好一个轴厚度为零，另外两轴宽度大于零。")
-            valid_meshes = [mesh for mesh in meshes if isinstance(mesh, list) and len(mesh) == 6
-                            and all(isinstance(v, (int, float)) and not isinstance(v, bool)
-                                    and math.isfinite(v) for v in mesh)
-                            and all(mesh[i] < mesh[i + 1] for i in (0, 2, 4))]
-            if not any(all(mesh[axis] <= value[axis] <= value[axis + 1] <= mesh[axis + 1]
-                           for axis in (0, 2, 4)) for mesh in valid_meshes):
-                raise ToolError("VENT.XB 必须完整位于至少一个源 MESH.XB 内。")
-        if base == "SURF_ID" and record_type == "VENT":
-            existing_surface_ids = [item["fields"].get("ID") for item in parsed["records"]
-                                     if item["record"] == "SURF"]
-            if (not isinstance(value, str) or (value.upper() != "OPEN"
-                    and sum(1 for item in existing_surface_ids if item == value) != 1)):
-                raise ToolError("VENT.SURF_ID 必须是 OPEN 或精确引用源算例中唯一一条 SURF.ID。")
-        if base == "XB" and record_type == "VENT":
-            import math
-            if (not isinstance(value, list) or len(value) != 6 or any(
-                    isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item)
-                    for item in value)):
-                raise ToolError("VENT.XB 必须是 6 个有限数值。")
-            if any(value[axis] > value[axis + 1] for axis in (0, 2, 4)) or sum(
-                    value[axis] == value[axis + 1] for axis in (0, 2, 4)) != 1:
-                raise ToolError("VENT.XB 必须恰好一个轴厚度为零，其余两个轴宽度大于零。")
-            mesh_boxes = [item["fields"].get("XB") for item in parsed["records"]
-                          if item["record"] == "MESH"]
-            if not any(isinstance(box, list) and len(box) == 6 and all(
-                    isinstance(bound, (int, float)) and not isinstance(bound, bool)
-                    and math.isfinite(bound) for bound in box) and all(
-                    box[axis] <= value[axis] and value[axis + 1] <= box[axis + 1]
-                    for axis in (0, 2, 4)) for box in mesh_boxes):
-                raise ToolError("VENT.XB 必须完整位于一个有效 MESH.XB 内。")
-        if base == "SURF_ID" and record_type == "VENT":
-            if not isinstance(value, str):
-                raise ToolError("VENT.SURF_ID 必须是现有 SURF.ID 或 OPEN 文本。")
-            if value.upper() != "OPEN" and sum(
-                    1 for item in parsed["records"] if item["record"] == "SURF"
-                    and item["fields"].get("ID") == value) != 1:
-                raise ToolError("VENT.SURF_ID 必须精确引用源算例中唯一一条现有 &SURF.ID。")
+        _validate_boundary_field_shape(record_type, normalized, value, exists,
+                                       original_body, parsed["records"])
         formatted, expected = (_typed_fds_value(value, target["fields"][normalized], normalized)
                                if exists else _new_fds_value(value, normalized))
         normalized_updates[normalized] = value
