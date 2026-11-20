@@ -1493,6 +1493,30 @@ def preview_boundary_field_edits(config: dict, source_id: str, new_case_id: str,
             raise ToolError("XB 只能修改现有 VENT.XB；其他几何使用专用工具。")
         if base == "SURF_ID" and (record_type != "VENT" or "(" in normalized):
             raise ToolError("SURF_ID 只能在 VENT 上设置。")
+        if base == "XB" and record_type == "VENT":
+            import math
+            if (not isinstance(value, list) or len(value) != 6 or any(
+                    isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item)
+                    for item in value)):
+                raise ToolError("VENT.XB 必须是 6 个有限数值。")
+            if any(value[axis] > value[axis + 1] for axis in (0, 2, 4)) or sum(
+                    value[axis] == value[axis + 1] for axis in (0, 2, 4)) != 1:
+                raise ToolError("VENT.XB 必须恰好一个轴厚度为零，其余两个轴宽度大于零。")
+            mesh_boxes = [item["fields"].get("XB") for item in parsed["records"]
+                          if item["record"] == "MESH"]
+            if not any(isinstance(box, list) and len(box) == 6 and all(
+                    isinstance(bound, (int, float)) and not isinstance(bound, bool)
+                    and math.isfinite(bound) for bound in box) and all(
+                    box[axis] <= value[axis] and value[axis + 1] <= box[axis + 1]
+                    for axis in (0, 2, 4)) for box in mesh_boxes):
+                raise ToolError("VENT.XB 必须完整位于一个有效 MESH.XB 内。")
+        if base == "SURF_ID" and record_type == "VENT":
+            if not isinstance(value, str):
+                raise ToolError("VENT.SURF_ID 必须是现有 SURF.ID 或 OPEN 文本。")
+            if value.upper() != "OPEN" and sum(
+                    1 for item in parsed["records"] if item["record"] == "SURF"
+                    and item["fields"].get("ID") == value) != 1:
+                raise ToolError("VENT.SURF_ID 必须精确引用源算例中唯一一条现有 &SURF.ID。")
         formatted, expected = (_typed_fds_value(value, target["fields"][normalized], normalized)
                                if exists else _new_fds_value(value, normalized))
         normalized_updates[normalized] = value
@@ -1509,6 +1533,14 @@ def preview_boundary_field_edits(config: dict, source_id: str, new_case_id: str,
                 "target_id": target_id, "updates": normalized_updates}
     preview_root = _boundary_preview_root(config)
     preview_root.mkdir(parents=True, exist_ok=True)
+    for stale in preview_root.glob("*.json"):
+        try:
+            old = json.loads(stale.read_text(encoding="utf-8"))
+            expired = time.time() - float(old.get("created_at", 0)) > 3600
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            expired = True
+        if expired:
+            stale.unlink(missing_ok=True)
     (preview_root / f"{preview_id}.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"preview_id": preview_id, "expires_in_seconds": 3600,
